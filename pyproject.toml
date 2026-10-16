@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qivaryn-engine"
+version = "1.0.0"
+description = "A media download engine designed for multiple platforms, currently supporting Instagram."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Usama Nadeem (@usamanadim)" }
+]
+dependencies = [
+    "requests>=2.28.0",
+    "click>=8.0.0",
+    "tqdm>=4.64.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/usamanadim/qivaryn-engine"
+Repository = "https://github.com/usamanadim/qivaryn-engine"
+Issues = "https://github.com/usamanadim/qivaryn-engine/issues"
+
+[project.scripts]
+qivaryn = "qivaryn.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["qivaryn*"]
+
+[tool.setuptools.package-data]
+qivaryn = ["ATTRIBUTION.json"]
