@@ -163,16 +163,23 @@ python -m build
 ## Publishing to PyPI (maintainers)
 
 The GitHub Actions workflow at `.github/workflows/publish.yml` builds
-distributions and publishes them when a GitHub release is published. It uses
-PyPI Trusted Publishing, so no PyPI API token is stored in GitHub.
+distributions when a GitHub release is published, attaches the wheel and source
+archive to that release, and publishes the package to PyPI. It uses PyPI
+Trusted Publishing, so no PyPI API token is stored in GitHub.
 
 Before the first publish:
 
 1. Create the `qivaryn-engine` project on PyPI by configuring a Trusted
    Publisher for owner `usamanadim`, repository `qivaryn-engine`, workflow
    `publish.yml`, and GitHub environment `pypi`.
-2. For future versions, update `version` in `pyproject.toml`, create and push
-   a matching `vX.Y.Z` tag, then publish a GitHub release for that tag.
+2. In `pyproject.toml`, set the project version to the version you intend to
+   publish. Create and push a matching `vX.Y.Z` tag, then publish a GitHub
+   release for that tag. The workflow attaches the built `.whl` and `.tar.gz`
+   files to the release and publishes the same distributions to PyPI.
+
+GitHub Packages does not support hosting Python packages. PyPI is the package
+registry for this project; the GitHub release provides version notes and
+downloadable distribution files.
 
 ## License and required attribution
 
