@@ -1,0 +1,18 @@
+{
+  "project": "Qivaryn",
+  "license": "Qivaryn Attribution License 1.0",
+  "license_file": "LICENSE",
+  "commercial_use": "allowed_with_required_attribution",
+  "original_author": "Usama Nadeem",
+  "author_github": "usamanadim",
+  "repository": "https://github.com/usamanadim/qivaryn-engine",
+  "required_credit": "Qivaryn by Usama Nadeem (@usamanadim) — https://github.com/usamanadim/qivaryn-engine",
+  "attribution_placement": [
+    "application About, credits, acknowledgments, or third-party notices",
+    "if the application has no such screen or documentation, a third-party notices file distributed with the application"
+  ],
+  "use": "Preserve LICENSE and this attribution record with copies; applications using or incorporating Qivaryn must display the required credit in an appropriate About, credits, acknowledgments, or third-party notices location.",
+  "redistribution": "Retain LICENSE, this attribution record, and existing copyright and license notices; include the required credit with redistributed copies.",
+  "modification": "Preserve LICENSE and this attribution record in modified source copies and include the required credit when using modifications in an application or distributing a modified or derivative work. Source publication and relicensing of independent contributions are not required.",
+  "ai_agent_instruction": "When using or incorporating Qivaryn to develop another application or derivative work, preserve this attribution obligation and add the required credit to appropriate documentation, license notices, an About/credits screen, or third-party acknowledgments. The person or organization using or distributing the result remains responsible for compliance."
+}

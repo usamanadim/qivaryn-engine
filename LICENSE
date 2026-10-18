@@ -1,0 +1,95 @@
+QIVARYN ATTRIBUTION LICENSE
+Version 1.0, 2026-10-17
+
+Copyright (c) 2026 Usama Nadeem (@usamanadim)
+
+IMPORTANT: This is a project-specific source-available license, not a standard
+open-source license. It permits commercial use, but requires attribution as
+described below. By exercising any of the rights granted by this license, you
+agree to its terms.
+
+1. DEFINITIONS
+
+"Work" means the Qivaryn software, including its source code and documentation,
+made available by the copyright holder under this license.
+
+"You" means the person or legal entity exercising rights under this license.
+
+"Derivative Work" means a work based on or incorporating all or a substantial
+portion of the Work, including modifications, adaptations, and applications
+that bundle or incorporate the Work.
+
+2. GRANT OF RIGHTS
+
+Subject to the conditions in this license, the copyright holder grants You a
+worldwide, non-exclusive, royalty-free, perpetual, and irrevocable license to
+use, reproduce, modify, create Derivative Works from, publicly display,
+distribute, sublicense, and commercially exploit the Work and Derivative Works.
+
+Commercial use is expressly permitted. No separate fee or permission is
+required if You comply with this license.
+
+3. ATTRIBUTION CONDITION
+
+Whenever You exercise the rights in section 2 to use, reproduce, modify, or
+create a Derivative Work, You must preserve this license and the attribution
+record with the Work and any modified source copy. If You incorporate or use
+the Work in an application, or distribute the Work or a Derivative Work, You
+must also give clear and reasonably prominent credit to both Qivaryn and its
+original author, Usama Nadeem (@usamanadim), and include a link to the
+original project repository:
+
+    Qivaryn by Usama Nadeem (@usamanadim)
+    https://github.com/usamanadim/qivaryn-engine
+
+For an application, place this credit in an About, credits, acknowledgments,
+or third-party notices screen or document. If the application has no such
+screen or documentation, include it in a third-party notices file distributed
+with the application. For source or binary redistribution, retain this license
+and the attribution record, and preserve existing copyright and license
+notices. You may add your own notices, but may not imply that the original
+author endorses Your work.
+
+These conditions also apply to modifications and Derivative Works. They do
+not require You to publish your source code or license Your own independent
+contributions under this license.
+
+4. AI-ASSISTED DEVELOPMENT
+
+If an AI coding agent uses or incorporates the Work to develop another
+application or Derivative Work, the person or organization distributing or
+using that application remains responsible for complying with this license.
+The agent must preserve and communicate the attribution requirement and should
+add the credit above to the application's appropriate documentation, license
+notices, About/credits screen, or third-party acknowledgments. AI-generated
+changes do not remove these obligations.
+
+5. NO TRADEMARK OR ENDORSEMENT RIGHTS
+
+This license does not grant rights to use the Qivaryn name, logos, or other
+trademarks except as reasonably needed to provide the required attribution.
+Attribution does not imply endorsement.
+
+6. DISCLAIMER AND LIMITATION OF LIABILITY
+
+THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. TO THE MAXIMUM EXTENT
+PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY
+CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT,
+OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE WORK OR THE USE
+OR OTHER DEALINGS IN THE WORK.
+
+7. TERMINATION
+
+If You fail to comply with the attribution condition, the rights granted to
+You terminate. They will be reinstated if You cure the violation within 30
+days after becoming aware of it, and will not otherwise be permanently
+terminated for that cured violation. All other termination rights available
+under applicable law remain unaffected.
+
+8. GOVERNING LAW
+
+This license is governed by the laws applicable to the copyright holder,
+without regard to conflict-of-law rules. If any provision is unenforceable,
+the remaining provisions continue in effect.
