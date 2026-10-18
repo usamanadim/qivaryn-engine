@@ -40,7 +40,7 @@ class DashManifestAndResolutionTests(unittest.TestCase):
         self.assertEqual(v["url"], "https://cdn.example/1080.mp4?cat=1&token=xyz")
         self.assertEqual(a["url"], "https://cdn.example/audio.m4a?cat=2&token=123")
 
-    def test_select_best_video_prefers_1080p_dash(self):
+    def test_select_best_video_prefers_1080p_dash_and_canonical_audio(self):
         client = InstagramClient()
         item = {
             "code": "TEST_DASH_1080P",
@@ -49,6 +49,19 @@ class DashManifestAndResolutionTests(unittest.TestCase):
             "video_versions": [
                 {"width": 720, "height": 1280, "url": "https://cdn.example/prog_720.mp4"}
             ]
+        }
+        v_url, a_url, qual = client._select_best_video(item)
+        self.assertEqual(v_url, "https://cdn.example/1080.mp4")
+        self.assertEqual(a_url, "https://cdn.example/prog_720.mp4")
+        self.assertIn("1080p", qual)
+
+    def test_select_best_video_falls_back_to_dash_audio_when_no_progressive(self):
+        client = InstagramClient()
+        item = {
+            "code": "TEST_DASH_ONLY",
+            "media_type": 2,
+            "video_dash_manifest": """<MPD><Period><AdaptationSet contentType="video"><Representation width="1080" height="1920" FBQualityLabel="1080p"><BaseURL>https://cdn.example/1080.mp4</BaseURL></Representation></AdaptationSet><AdaptationSet contentType="audio"><Representation codecs="mp4a.40.2"><BaseURL>https://cdn.example/audio.m4a</BaseURL></Representation></AdaptationSet></Period></MPD>""",
+            "video_versions": []
         }
         v_url, a_url, qual = client._select_best_video(item)
         self.assertEqual(v_url, "https://cdn.example/1080.mp4")
@@ -67,7 +80,7 @@ class DashManifestAndResolutionTests(unittest.TestCase):
         }
         v_url, a_url, qual = client._select_best_video(item)
         self.assertEqual(v_url, "https://cdn.example/prog_1080.mp4")
-        self.assertEqual(a_url, "https://cdn.example/audio.m4a")
+        self.assertEqual(a_url, "https://cdn.example/prog_1080.mp4")
         self.assertIn("1080", qual)
 
     def test_prefers_clips_standard_aac_over_xheaac_dash(self):

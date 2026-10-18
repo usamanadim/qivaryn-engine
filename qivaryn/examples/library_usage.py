@@ -17,8 +17,14 @@ def main():
     target_account = "natgeo"
     print(f"Starting programmatic download for @{target_account}...")
 
-    # Run bulk download with early-exit resumption
-    engine.download_account(target_account, max_pages=5)
+    # Example 1: Run bulk download for posts (photos & carousels) with count limit
+    engine.download_account(target_account, media_type_filter="posts", count=10)
+
+    # Example 2: Download only carousel albums
+    # engine.download_account(target_account, media_type_filter="carousels", count=5)
+
+    # Example 3: Download using profile or post URL directly
+    # engine.download_url(f"https://www.instagram.com/{target_account}/", count=10, media_type="posts")
 
 if __name__ == "__main__":
     main()

@@ -1,210 +1,269 @@
 # Qivaryn
 
-Qivaryn is a Python library and command-line media download engine designed
-to support multiple platforms. Instagram is the first available platform;
-support for additional platforms is planned.
+Qivaryn is a high-performance, multi-platform media downloader with a shared command-line interface and Python API. Its platform integrations handle the details that differ between services, while common download options and history management work the same way wherever supported. Instagram is the first supported platform; support for additional platforms is planned.
+
+---
 
 ## Features
 
-- Selects the highest available progressive or DASH Instagram video stream,
-  including 1080p when Instagram provides it.
-- Downloads individual posts or scans an account feed with support for
-  resuming past already-downloaded media.
-- Tracks downloads in a local SQLite database so existing files can be
-  skipped.
-- Offers both a command-line interface and a Python library API.
+- **Multi-platform design**: A shared downloader interface is built to support multiple media platforms through platform-specific integrations.
+- **Automatic URL Detection**: Pass a URL from a supported platform and Qivaryn routes it to the appropriate downloader.
+- **High-quality downloads**: The current Instagram integration selects available progressive or DASH video streams (up to 1080p) and downloads carousel slides in original resolution.
+- **Media Filtering**: Filter account downloads by media type where the platform supports it. Available types can vary by platform.
+- **DASH Audio & Video Merging**: On platforms that provide split DASH streams, Qivaryn uses FFmpeg to merge audio and video.
+- **Batch Limits (`--count`)**: Specify the exact number of **new** items to save. Previously downloaded content is automatically skipped without counting toward the quota.
+- **Download Resumption**: Tracks downloaded item identifiers in a local SQLite database (`qivaryn_state.db`), allowing previously saved items to be skipped. The current Instagram integration tracks post shortcodes.
+- **Dual Interface**: Offers both a command-line interface (CLI) and a Python library API.
+
+### Supported platforms
+
+- **Instagram** — currently supported.
+- **Additional platforms** — planned; not supported yet.
+
+Commands and common options are intended to remain consistent across platforms. URL formats, authentication methods, media filters, and other service-specific options may differ.
+
+---
 
 ## Requirements
 
-- Python 3.8 or newer
-- FFmpeg available on `PATH` to merge separate Reel video and audio streams
-- An Instagram session or Netscape-format cookies file may be needed for some
-  media or account feeds
+- **Python 3.8** or newer
+- **FFmpeg** available on your system `PATH` when downloading from a platform that requires it to merge DASH audio and video.
+- Authentication is platform-specific. For Instagram, an optional session (`--cookies cookies.txt` or `--sessionid`) may be needed for private content, deeper pagination, or higher rate limits.
 
-Instagram may change its APIs or limit requests, so availability is not
-guaranteed. Use Qivaryn only for media you are authorized to access and
-download, and follow Instagram's terms and applicable copyright laws. Qivaryn
-is an independent project and is not affiliated with Instagram or Meta.
+---
 
 ## Installation
 
-### Stable release (PyPI)
+### Install from local checkout (Recommended for development)
 
-```bash
-python -m pip install --upgrade qivaryn-engine
+```console
+git clone https://github.com/usamanadim/qivaryn-engine.git
+cd qivaryn-engine
+python -m pip install -e .
 ```
 
-This command will be available after the first Qivaryn release is published
-to PyPI.
-
-### Latest development version (GitHub)
+### Install latest development version from GitHub
 
 ```bash
 python -m pip install --upgrade "git+https://github.com/usamanadim/qivaryn-engine.git@main"
 ```
 
-This requires Git and access to the repository.
+---
 
-### Install from a local checkout
+## Quick Start (Cheatsheet)
 
-```console
-git clone https://github.com/usamanadim/qivaryn-engine.git
-cd qivaryn-engine
-python -m pip install .
+Download content from a supported platform with one command. This example uses Instagram, the platform currently supported:
+
+```bash
+qivaryn "https://www.instagram.com/USERNAME/"
 ```
 
-For local development, install the checkout in editable mode:
+---
+
+## Command-Line Usage
+
+### 1. Automatic URL Command
+
+Pass a URL from a supported platform directly to the CLI. Qivaryn detects the platform and content type from the URL:
 
 ```console
-python -m pip install -e .
+qivaryn "<SUPPORTED_URL>" [OPTIONS]
 ```
 
-## Command-line usage
+For the currently supported Instagram URLs, Qivaryn routes automatically:
 
-Choose a platform with `--platform`. Instagram is currently the only available
-option, and it remains the default so existing commands continue to work:
+- **Single Post / Reel URL** (`/p/SHORTCODE/` or `/reel/SHORTCODE/`):
+  Downloads that specific item. If it is a carousel, all slides (images and videos) are downloaded.
+- **Reels Tab URL** (`/<username>/reels/`):
+  Scans the dedicated Reels tab and downloads Reels chronologically.
+- **Account Profile URL** (`/<username>/`):
+  - When `--type` is omitted or `all`: downloads grid posts (photos and carousels) and continues into the dedicated Reels tab.
+  - When `--type posts`: downloads photos and carousels from the profile grid.
+  - When `--type carousels`: downloads only multi-slide carousel albums.
+  - When `--type reels`: downloads videos from the Reels tab.
+
+#### Available Options
+
+| Option | Shorthand | Description | Default |
+| --- | --- | --- | --- |
+| `--type TYPE` | | Filter media where supported. Instagram types include `all`, `posts`, `reels`, `videos`, or `carousels`. | `all` |
+| `--count N` | `-n N`, `--limit N` | Maximum number of **new** items to save before stopping. | Unlimited |
+| `--cookies PATH` | `--cookies-file` | Instagram: path to a Netscape-format `cookies.txt` file. Authentication options may vary by platform. | None |
+| `--sessionid STR` | | Instagram-specific `sessionid` cookie value. | None |
+| `--output DIR` | `-o DIR` | Directory to save downloaded media files. | `./downloads` |
+| `--db PATH` | | Path to SQLite state database for download tracking. | `qivaryn_state.db` |
+| `--max-pages N` | | Maximum feed pagination pages to scan. | Unlimited |
+| `--force` | `-f` | Re-download and overwrite even if already saved. | `False` |
+
+The explicit `single`, `download`, and `clear-db` subcommands also accept `--platform`. At present, the available platform choice is `instagram`.
+
+---
+
+### 2. Explicit Subcommands
+
+If you prefer explicit subcommands instead of automatic URL detection:
+
+#### `qivaryn single`
+
+Downloads a single item by URL or identifier. The accepted identifier depends on the selected platform. For Instagram:
 
 ```console
-qivaryn single --platform instagram "https://www.instagram.com/reel/SHORTCODE/"
+qivaryn single "https://www.instagram.com/p/SHORTCODE/"
+qivaryn single "https://www.instagram.com/p/SHORTCODE/" --output ./my_media
+qivaryn single SHORTCODE --cookies ./cookies.txt
 ```
 
-When Instagram provides separate video and audio streams for a Reel, FFmpeg
-must be installed and available on `PATH` to merge them. If FFmpeg is missing
-or merging fails, Qivaryn reports the problem instead of silently saving a
-video-only file.
+#### `qivaryn download`
 
-Download one post, Reel, or carousel by URL or shortcode:
+Downloads account content using a platform-specific account name or identifier. For Instagram:
 
 ```console
-qivaryn single --platform instagram "https://www.instagram.com/reel/SHORTCODE/" --cookies cookies.txt
+# Download up to 25 new Reels from an account
+qivaryn download natgeo --type reels --count 25
+
+# Download up to 10 image / carousel posts
+qivaryn download natgeo --type posts --count 10
+
+# Download only multi-item carousel albums
+qivaryn download natgeo --type carousels --count 5
+
+# Download with an explicit early-exit threshold (halt after 5 consecutive known items)
+qivaryn download natgeo --threshold 5
 ```
 
-Download an account's Reels:
+---
+
+## Media Filtering Guide (`--type`)
+
+Media type names are platform-specific. The following values describe the current Instagram integration; available content and filters may differ for other platform integrations in the future.
+
+| Value | What It Downloads | Excludes |
+| --- | --- | --- |
+| `all` *(default)* | All posts, photos, carousels, and Reels. | None |
+| `posts` | Profile grid image posts and multi-item carousels. | Standalone video Reels |
+| `carousels` | Multi-slide carousel albums only (multi-image / multi-video). | Single-photo posts and Reels |
+| `reels` (or `videos`) | Video Reels from the dedicated Reels tab or feed. | Static image posts |
+
+---
+
+## Instagram Authentication (`cookies.txt` and `--sessionid`)
+
+Authentication requirements depend on the platform. For Instagram, public accounts and Reels can often be downloaded without logging in. An authenticated session may be needed for:
+
+- Private accounts you follow.
+- Deep pagination of account post grids.
+- Avoiding Instagram rate limits (HTTP 429).
+
+### How to Export `cookies.txt` from Your Browser
+
+1. In Google Chrome, Microsoft Edge, or Firefox, install a cookie export extension:
+   - **Get cookies.txt LOCALLY** (recommended, open source)
+   - **Cookie-Editor** (select *Export* → *Netscape*)
+2. Navigate to [instagram.com](https://www.instagram.com) and ensure you are logged into your account.
+3. Click the extension icon and export the cookies in **Netscape format**.
+4. Save the file as `cookies.txt` in your project folder (or pass its absolute path):
+   ```console
+   qivaryn "https://www.instagram.com/USERNAME/" --cookies cookies.txt
+   ```
+
+### Using `--sessionid` Directly
+
+Alternatively, copy your `sessionid` cookie value directly from your browser:
+
+1. Open [instagram.com](https://www.instagram.com) in your browser.
+2. Press `F12` to open Developer Tools.
+3. Go to **Application** (or **Storage** in Firefox) → **Cookies** → `https://www.instagram.com`.
+4. Copy the value of the `sessionid` cookie and pass it:
+   ```console
+   qivaryn "https://www.instagram.com/USERNAME/" --sessionid "YOUR_SESSION_ID"
+   ```
+
+> [!IMPORTANT]
+> Treat `cookies.txt` and session IDs like passwords. Do not commit them to Git. Qivaryn's `.gitignore` automatically ignores `cookies.txt`.
+
+---
+
+## Managing Download History (`clear-db`)
+
+Qivaryn records downloaded item identifiers in `qivaryn_state.db` so you can skip previously saved files. For Instagram, these identifiers are post shortcodes. The `clear-db` command manages download history without deleting media files from disk:
 
 ```console
-qivaryn download --platform instagram USERNAME --type reels --cookies cookies.txt
-```
-
-The `--type` option accepts `all`, `posts`, or `reels`. Use `--max-pages N` to
-limit how many feed pages are scanned, and `--force` to download media again
-even if it is already recorded.
-
-The `--platform` option is also available on `clear-db`. The CLI accepts a
-direct Instagram session ID with `--sessionid SESSION_ID`. Treat session IDs
-and cookie files as secrets: do not share them or commit them to Git.
-
-By default, downloads go to `./downloads` and download history is stored in
-`qivaryn_state.db`. Override these locations with `--output` and `--db`. To
-continue using an existing database, pass its path with `--db`.
-
-### Manage download history
-
-These commands remove database records only; they do not delete media files:
-
-```console
-# Remove one record
+# Remove a single post from the database so it can be re-downloaded
 qivaryn clear-db SHORTCODE
+qivaryn clear-db --item "https://www.instagram.com/p/SHORTCODE/"
 
-# Remove records for files that are missing from disk
+# Prune database records for media files that were deleted from disk
 qivaryn clear-db --missing
 
-# Clear the entire history, after confirmation
+# Clear the entire download history (prompts for confirmation)
 qivaryn clear-db
+
+# Clear the entire history without a confirmation prompt
+qivaryn clear-db --yes
 ```
 
-Add `--yes` to `clear-db` to skip the confirmation prompt when clearing the
-entire history.
+---
 
-## Python library
+## Python Library API
+
+You can embed Qivaryn into your own Python applications, automation scripts, and background workers. The example below uses the current Instagram integration; available methods and options may vary by platform:
 
 ```python
 from qivaryn import QivarynEngine
 
+# Initialize the engine
 engine = QivarynEngine(
     output_dir="./downloads",
     db_path="./qivaryn_state.db",
-    sessionid="YOUR_INSTAGRAM_SESSION_ID",
+    cookies_file="./cookies.txt",  # Optional: omit for public content
+    # sessionid="YOUR_SESSION_ID", # Alternative to cookies_file
+    consecutive_threshold=3,       # Stop after N consecutive known items
 )
-engine.download_account("USERNAME", max_pages=5)
+
+# 1. Download automatically based on URL with count limit and media type filter
+engine.download_url(
+    "https://www.instagram.com/natgeo/",
+    count=20,
+    media_type="posts",  # 'all', 'posts', 'reels', 'videos', or 'carousels'
+)
+
+# 2. Download from an account by username
+engine.download_account(
+    username="natgeo",
+    count=10,
+    media_type_filter="carousels",
+)
+
+# 3. Download a single post or Reel
+engine.download_single(
+    "https://www.instagram.com/reel/C7xYabcdefG/",
+    force=False,
+)
 ```
 
-The session ID is optional for some public media. Keep real credentials out of
-source code; use environment variables or another secure secret store in
-applications.
+See [`qivaryn/examples/library_usage.py`](qivaryn/examples/library_usage.py) for a complete runnable script.
 
-`QivarynEngine` currently downloads Instagram media. It is also exported as
-`InstagramEngine` to make the platform-specific implementation explicit; the
-existing `QivarynEngine` name remains supported.
+---
 
-See [`qivaryn/examples/library_usage.py`](qivaryn/examples/library_usage.py)
-for a complete example.
+## Development & Testing
 
-## Development
-
-Create and activate a virtual environment, then install the project in
-editable mode:
+Activate your virtual environment and install test dependencies:
 
 ```console
-python -m venv .venv
-python -m pip install -e .
-```
-
-The project uses setuptools and declares its runtime dependencies in
-`pyproject.toml`.
-
-Run the unit tests and verify the source and wheel distributions with:
-
-```console
+# Run all unit tests
 python -m unittest discover -s tests -v
+
+# Build wheels and source distribution
 python -m pip install build
 python -m build
 ```
 
-## Publishing to PyPI (maintainers)
+---
 
-The GitHub Actions workflow at `.github/workflows/publish.yml` builds
-distributions when a GitHub release is published, attaches the wheel and source
-archive to that release, and publishes the package to PyPI. It uses PyPI
-Trusted Publishing, so no PyPI API token is stored in GitHub.
+## License and Required Attribution
 
-Before the first publish:
+Qivaryn is licensed under the **Qivaryn Attribution License 1.0** in [`LICENSE`](LICENSE). Commercial use is permitted. Anyone using, modifying, incorporating, or distributing Qivaryn must credit the original author:
 
-1. Create the `qivaryn-engine` project on PyPI by configuring a Trusted
-   Publisher for owner `usamanadim`, repository `qivaryn-engine`, workflow
-   `publish.yml`, and GitHub environment `pypi`.
-2. In `pyproject.toml`, set the project version to the version you intend to
-   publish. Create and push a matching `vX.Y.Z` tag, then publish a GitHub
-   release for that tag. The workflow attaches the built `.whl` and `.tar.gz`
-   files to the release and publishes the same distributions to PyPI.
+> **Qivaryn by Usama Nadeem (@usamanadim)** — https://github.com/usamanadim/qivaryn-engine
 
-GitHub Packages does not support hosting Python packages. PyPI is the package
-registry for this project; the GitHub release provides version notes and
-downloadable distribution files.
-
-## License and required attribution
-
-Qivaryn is licensed under the Qivaryn Attribution License 1.0 in
-[`LICENSE`](LICENSE). Commercial use is allowed. Anyone exercising rights to
-use, modify, incorporate, or distribute Qivaryn must preserve its license and
-attribution record. Anyone incorporating it into an application or
-distributing a copy or derivative work must credit Qivaryn and its original
-author, Usama Nadeem (`@usamanadim`), and link to the original repository.
-The license explains where to place the credit, which notices to retain, and
-how the terms apply to modifications and derivative works. It does not
-require publishing your source code.
-
-Recommended credit:
-
-> Qivaryn by Usama Nadeem (@usamanadim) —
-> https://github.com/usamanadim/qivaryn-engine
-
-If an application has no About/credits screen or documentation, include the
-credit in a third-party notices file distributed with it. AI coding agents
-must preserve this obligation and add the credit to the appropriate
-documentation, license notices, About/credits screen, or third-party
-acknowledgments when using Qivaryn to develop another application. The
-application's user or distributor remains responsible for compliance.
-
-Machine-readable attribution details are in
-[`qivaryn/ATTRIBUTION.json`](qivaryn/ATTRIBUTION.json). Rights already granted
-under an earlier license are not retroactively revoked.
+Machine-readable attribution metadata is available in [`qivaryn/ATTRIBUTION.json`](qivaryn/ATTRIBUTION.json).

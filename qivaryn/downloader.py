@@ -3,7 +3,7 @@ import shutil
 import subprocess
 import requests
 from tqdm import tqdm
-from typing import Optional
+from typing import Callable, Iterable, Optional, Tuple
 from .client import InstagramClient
 from .database import StateDatabase
 
@@ -14,6 +14,11 @@ class QivarynEngine:
         self.db = StateDatabase(db_path=db_path)
         self.consecutive_threshold = consecutive_threshold
         os.makedirs(self.output_dir, exist_ok=True)
+
+    @staticmethod
+    def detect_url(url: str) -> Optional[Tuple[str, str]]:
+        """Classifies URLs supported by this platform engine."""
+        return InstagramClient.detect_url(url)
 
     def _is_item_already_saved(self, shortcode: str) -> bool:
         """Checks if media is actually saved on disk. If file was manually deleted from disk, prunes stale record."""
@@ -98,8 +103,111 @@ class QivarynEngine:
             print(f"[-] Failed to download item: {shortcode}")
             return False
 
-    def download_account(self, username: str, media_type_filter: str = "all", max_pages: Optional[int] = None, force: bool = False):
+    def download_account(
+        self,
+        username: str,
+        media_type_filter: str = "all",
+        max_pages: Optional[int] = None,
+        force: bool = False,
+        count: Optional[int] = None,
+    ) -> int:
         """Downloads account content with early-exit resumption and zero redundant processing."""
+        return self._download_account_feed(
+            username,
+            self.client.fetch_user_raw_posts_paginated,
+            media_type_filter=media_type_filter,
+            max_pages=max_pages,
+            force=force,
+            count=count,
+        )
+
+    def download_account_reels(
+        self,
+        username: str,
+        max_pages: Optional[int] = None,
+        force: bool = False,
+        count: Optional[int] = None,
+    ) -> int:
+        """Downloads Reels from an account's dedicated Reels tab."""
+        return self._download_account_feed(
+            username,
+            self.client.fetch_user_raw_reels_paginated,
+            media_type_filter="reels",
+            max_pages=max_pages,
+            force=force,
+            count=count,
+            feed_name="Reels tab",
+        )
+
+    def download_account_content(
+        self,
+        username: str,
+        max_pages: Optional[int] = None,
+        force: bool = False,
+        count: Optional[int] = None,
+    ):
+        """Downloads profile-grid posts and Reels from the dedicated Reels tab."""
+        downloaded = self.download_account(
+            username,
+            media_type_filter="posts",
+            max_pages=max_pages,
+            force=force,
+            count=count,
+        )
+        remaining = count - downloaded if count is not None else None
+        if remaining is None or remaining > 0:
+            downloaded += self.download_account_reels(
+                username,
+                max_pages=max_pages,
+                force=force,
+                count=remaining,
+            )
+        return downloaded
+
+    def download_url(
+        self,
+        url: str,
+        max_pages: Optional[int] = None,
+        force: bool = False,
+        count: Optional[int] = None,
+        media_type: Optional[str] = None,
+    ):
+        """Downloads the content implied by a supported Instagram URL."""
+        target = self.detect_url(url)
+        if target is None:
+            raise ValueError(f"Unsupported Instagram URL: {url}")
+        target_type, identifier = target
+        if target_type == "single":
+            return self.download_single(url, force=force)
+        if target_type == "reels":
+            return self.download_account_reels(
+                identifier, max_pages=max_pages, force=force, count=count
+            )
+        if media_type and media_type.lower() != "all":
+            if media_type.lower() == "reels":
+                return self.download_account_reels(
+                    identifier, max_pages=max_pages, force=force, count=count
+                )
+            return self.download_account(
+                identifier, media_type_filter=media_type, max_pages=max_pages, force=force, count=count
+            )
+        return self.download_account_content(
+            identifier, max_pages=max_pages, force=force, count=count
+        )
+
+    def _download_account_feed(
+        self,
+        username: str,
+        fetch_items: Callable[..., Iterable[dict]],
+        media_type_filter: str = "all",
+        max_pages: Optional[int] = None,
+        force: bool = False,
+        count: Optional[int] = None,
+        feed_name: str = "account feed",
+    ) -> int:
+        """Downloads one account feed while sharing filtering and resume behavior."""
+        if count is not None and count <= 0:
+            raise ValueError("Count must be a positive integer greater than 0.")
         cached_id = self.db.get_cached_user_id(username)
         if cached_id:
             user_id = cached_id
@@ -112,44 +220,83 @@ class QivarynEngine:
 
         consecutive_known_count = 0
         total_downloaded = 0
+        skipped_existing = 0
         known_shortcodes = self.db.get_all_downloaded_shortcodes()
+        filter_mode = (media_type_filter or "all").lower()
 
-        for raw_item in self.client.fetch_user_raw_posts_paginated(user_id, max_pages=max_pages):
+        target_str = f" (target: {count} new items)" if count is not None else ""
+        print(f"[*] Scanning @{username} [{feed_name}; filter: {filter_mode}]{target_str}...")
+
+        # Pass username to fetch_items if supported
+        import inspect
+        try:
+            sig = inspect.signature(fetch_items)
+            fetch_kwargs = {"max_pages": max_pages}
+            if "username" in sig.parameters:
+                fetch_kwargs["username"] = username
+            items_gen = fetch_items(user_id, **fetch_kwargs)
+        except Exception:
+            items_gen = fetch_items(user_id, max_pages=max_pages)
+
+        for raw_item in items_gen:
+            if count is not None and total_downloaded >= count:
+                break
+
             shortcode = raw_item.get("code")
             if not shortcode:
                 continue
 
+            # Pre-filter media types directly from raw metadata before parsing heavy XML/DASH trees
+            raw_media_type = raw_item.get("media_type")
+            if filter_mode in ("reels", "videos") and raw_media_type != 2 and "video_versions" not in raw_item:
+                continue
+            if filter_mode == "carousels" and raw_media_type != 8 and "carousel_media" not in raw_item:
+                continue
+            if filter_mode == "posts" and raw_media_type == 2:
+                continue
+
             # ZERO-OVERHEAD SKIP: Check in-memory state before ANY parsing or network calls
             if not force and (shortcode in known_shortcodes or self._is_item_already_saved(shortcode)):
-                consecutive_known_count += 1
-                if consecutive_known_count >= self.consecutive_threshold:
-                    print(f"\n[>>] Early-Exit threshold reached ({self.consecutive_threshold} consecutive known items). Resumption complete instantly!")
-                    break
+                skipped_existing += 1
+                if count is None:
+                    consecutive_known_count += 1
+                    if consecutive_known_count >= self.consecutive_threshold:
+                        print(f"\n[>>] Early-Exit threshold reached ({self.consecutive_threshold} consecutive known items). Resumption complete instantly!")
+                        break
                 continue
             else:
                 consecutive_known_count = 0
 
-            # Filter media types directly from raw metadata before parsing heavy XML/DASH trees
-            raw_media_type = raw_item.get("media_type")
-            if media_type_filter == "posts" and raw_media_type == 2:
-                continue
-            if media_type_filter == "reels" and raw_media_type != 2:
-                continue
-
-            # Parse and extract 1080p ONLY for newly identified media items
-            post = self.client._parse_mobile_media_item(raw_item)
+            # Parse and extract media info
+            if raw_item.get("_needs_full_fetch"):
+                try:
+                    post = self.client.fetch_post_by_shortcode(shortcode)
+                except Exception as exc:
+                    print(f"[-] Could not fetch full details for {shortcode}: {exc}")
+                    continue
+            else:
+                post = self.client._parse_mobile_media_item(raw_item)
             m_type = post["media_type"]
 
-            if media_type_filter == "posts" and m_type == "Reel":
+            if filter_mode in ("reels", "videos") and m_type != "Reel":
                 continue
-            if media_type_filter == "reels" and m_type != "Reel":
+            if filter_mode == "carousels" and m_type != "Carousel":
+                continue
+            if filter_mode == "posts" and m_type == "Reel":
                 continue
 
             if self._download_media_item(post, force=force):
                 total_downloaded += 1
                 known_shortcodes.add(shortcode)
+                if count is not None:
+                    print(f"    [Batch Progress] {total_downloaded}/{count} new items downloaded.")
+                    if total_downloaded >= count:
+                        print(f"\n[+] Successfully reached target of {count} new items!")
+                        break
 
-        print(f"\n[+] Download session complete! Downloaded {total_downloaded} new items for @{username}.")
+        skip_str = f" ({skipped_existing} previously downloaded items skipped)" if skipped_existing > 0 else ""
+        print(f"\n[+] Download session complete! Downloaded {total_downloaded} new items{skip_str} for @{username}.")
+        return total_downloaded
 
     def _download_media_item(self, post: dict, force: bool = False) -> bool:
         shortcode = post["shortcode"]
