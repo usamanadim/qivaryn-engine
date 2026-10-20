@@ -6,13 +6,23 @@ from tqdm import tqdm
 from typing import Callable, Iterable, Optional, Tuple
 from .client import InstagramClient
 from .database import StateDatabase
+from .files import MEDIA_TYPE_BY_KIND, file_is_present, find_existing_media
 
 class QivarynEngine:
-    def __init__(self, output_dir: str = "./downloads", db_path: str = "qivaryn_state.db", sessionid: Optional[str] = None, cookies_file: Optional[str] = None, consecutive_threshold: int = 3):
+    def __init__(self, output_dir: str = "./downloads", db_path: str = "qivaryn_state.db", sessionid: Optional[str] = None, cookies_file: Optional[str] = None, consecutive_threshold: int = 3, allow_network_fallbacks: bool = True):
         self.output_dir = output_dir
-        self.client = InstagramClient(sessionid=sessionid, cookies_file=cookies_file)
+        self.client = InstagramClient(
+            sessionid=sessionid,
+            cookies_file=cookies_file,
+            allow_network_fallbacks=allow_network_fallbacks,
+        )
         self.db = StateDatabase(db_path=db_path)
-        self.consecutive_threshold = consecutive_threshold
+        try:
+            self.consecutive_threshold = int(consecutive_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"consecutive_threshold must be an integer, got {consecutive_threshold!r}."
+            ) from exc
         os.makedirs(self.output_dir, exist_ok=True)
 
     @staticmethod
@@ -24,20 +34,17 @@ class QivarynEngine:
         """Checks if media is actually saved on disk. If file was manually deleted from disk, prunes stale record."""
         if self.db.is_downloaded(shortcode):
             recorded_path = self.db.get_file_path(shortcode)
-            if recorded_path and os.path.exists(recorded_path) and os.path.getsize(recorded_path) > 0:
+            if recorded_path and recorded_path != "carousel_bundle" and file_is_present(recorded_path):
                 return True
             if recorded_path == "carousel_bundle":
-                for ext in [".mp4", ".jpg", ".jpeg", ".webp"]:
-                    if os.path.exists(os.path.join(self.output_dir, f"{shortcode}_1{ext}")):
+                # Carousel slides are stored as "<shortcode>_<index>.<ext>".
+                for ext in (".mp4", ".jpg", ".jpeg", ".webp"):
+                    if file_is_present(os.path.join(self.output_dir, f"{shortcode}_1{ext}")):
                         return True
+
             # Check standard file patterns in output_dir
-            for ext in [".mp4", ".jpg", ".jpeg", ".webp"]:
-                candidate = os.path.join(self.output_dir, f"{shortcode}{ext}")
-                if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                    return True
-                carousel_candidate = os.path.join(self.output_dir, f"{shortcode}_1{ext}")
-                if os.path.exists(carousel_candidate) and os.path.getsize(carousel_candidate) > 0:
-                    return True
+            if find_existing_media(self.output_dir, shortcode) is not None:
+                return True
 
             # The record is in DB, but the file was manually deleted from disk!
             # Automatically remove stale record so user can re-download it without being blocked
@@ -45,16 +52,19 @@ class QivarynEngine:
             return False
 
         # If not recorded in DB, check if file exists on disk
-        for ext in [".mp4", ".jpg", ".jpeg", ".webp"]:
-            candidate = os.path.join(self.output_dir, f"{shortcode}{ext}")
-            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
-                self.db.mark_downloaded(shortcode, "Reel" if ext == ".mp4" else "Post", "", candidate)
-                return True
-            carousel_candidate = os.path.join(self.output_dir, f"{shortcode}_1{ext}")
-            if os.path.exists(carousel_candidate) and os.path.getsize(carousel_candidate) > 0:
-                self.db.mark_downloaded(shortcode, "Carousel", "", "carousel_bundle")
-                return True
-        return False
+        existing = find_existing_media(self.output_dir, shortcode)
+        if existing is None:
+            return False
+
+        path, kind = existing
+        media_type = MEDIA_TYPE_BY_KIND[kind]
+        self.db.mark_downloaded(
+            shortcode,
+            media_type,
+            "",
+            "carousel_bundle" if kind == "carousel" else path,
+        )
+        return True
 
     def clear_database(self, item: Optional[str] = None, clear_all: bool = False, prune_missing: bool = False) -> int:
         """Removes records from the state database without deleting any media files from disk."""
@@ -70,10 +80,6 @@ class QivarynEngine:
         elif prune_missing:
             count = self.db.prune_missing(self.output_dir)
             print(f"[+] Pruned {count} missing records whose files were deleted from disk.")
-            return count
-        elif clear_all:
-            count = self.db.clear_all()
-            print(f"[+] Successfully cleared entire download history ({count} records removed). Existing media files preserved.")
             return count
         else:
             count = self.db.clear_all()
@@ -227,16 +233,8 @@ class QivarynEngine:
         target_str = f" (target: {count} new items)" if count is not None else ""
         print(f"[*] Scanning @{username} [{feed_name}; filter: {filter_mode}]{target_str}...")
 
-        # Pass username to fetch_items if supported
-        import inspect
-        try:
-            sig = inspect.signature(fetch_items)
-            fetch_kwargs = {"max_pages": max_pages}
-            if "username" in sig.parameters:
-                fetch_kwargs["username"] = username
-            items_gen = fetch_items(user_id, **fetch_kwargs)
-        except Exception:
-            items_gen = fetch_items(user_id, max_pages=max_pages)
+        # Both feed fetchers share the same signature, so the options are passed directly.
+        items_gen = fetch_items(user_id, max_pages=max_pages, username=username)
 
         try:
             for raw_item in items_gen:
@@ -276,7 +274,7 @@ class QivarynEngine:
                         print(f"[-] Could not fetch full details for {shortcode}: {exc}")
                         continue
                 else:
-                    post = self.client._parse_mobile_media_item(raw_item)
+                    post = self.client.parse_media_item(raw_item)
                 m_type = post["media_type"]
 
                 if filter_mode in ("reels", "videos") and m_type != "Reel":

@@ -25,7 +25,7 @@ class InstagramUrlDetectionTests(unittest.TestCase):
 
 class InstagramReelsFeedTests(unittest.TestCase):
     def test_reels_feed_unwraps_media_and_follows_cursor(self):
-        client = InstagramClient()
+        client = InstagramClient(allow_network_fallbacks=False)
         first_page = MagicMock()
         first_page.status_code = 200
         first_page.json.return_value = {
@@ -39,16 +39,16 @@ class InstagramReelsFeedTests(unittest.TestCase):
             "items": [{"media": {"code": "REEL_3"}}],
             "more_available": False,
         }
-        client.session.get = MagicMock(side_effect=[first_page, second_page])
+        client.session.post = MagicMock(side_effect=[first_page, second_page])
 
         items = list(client.fetch_user_raw_reels_paginated("123"))
 
         self.assertEqual([item["code"] for item in items], ["REEL_1", "REEL_2", "REEL_3"])
-        self.assertEqual(client.session.get.call_args_list[0].kwargs["params"], {
+        self.assertEqual(client.session.post.call_args_list[0].kwargs["data"], {
             "target_user_id": "123",
             "page_size": 12,
         })
-        self.assertEqual(client.session.get.call_args_list[1].kwargs["params"], {
+        self.assertEqual(client.session.post.call_args_list[1].kwargs["data"], {
             "target_user_id": "123",
             "page_size": 12,
             "max_id": "next-page",

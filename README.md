@@ -226,6 +226,7 @@ engine = QivarynEngine(
     cookies_file="./cookies.txt",  # Optional: omit for public content
     # sessionid="YOUR_SESSION_ID", # Alternative to cookies_file
     consecutive_threshold=3,       # Stop after N consecutive known items
+    allow_network_fallbacks=True,  # Retry without the session when it expires
 )
 
 # 1. Download automatically based on URL with count limit and media type filter
@@ -248,6 +249,11 @@ engine.download_single(
     force=False,
 )
 ```
+
+> [!TIP]
+> Set `allow_network_fallbacks=False` to disable the secondary unauthenticated
+> requests Qivaryn makes when a session expires (clean retries and HTML timeline
+> scraping). This is useful for offline runs and keeps unit tests off the network.
 
 See [`qivaryn/examples/library_usage.py`](qivaryn/examples/library_usage.py) for a complete runnable script.
 

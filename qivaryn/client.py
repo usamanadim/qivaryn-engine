@@ -6,7 +6,7 @@ import base64
 import html
 import xml.etree.ElementTree as ET
 from http.cookiejar import LoadError, MozillaCookieJar
-from typing import Any, Optional, Generator, Tuple
+from typing import Any, Dict, Optional, Generator, Tuple
 from urllib.parse import urljoin, urlsplit
 
 class InstagramClient:
@@ -33,7 +33,21 @@ class InstagramClient:
             return "account", parts[0]
         return None
 
-    def __init__(self, sessionid: Optional[str] = None, cookies_file: Optional[str] = None):
+    def __init__(
+        self,
+        sessionid: Optional[str] = None,
+        cookies_file: Optional[str] = None,
+        allow_network_fallbacks: bool = True,
+    ):
+        """Creates a client for the Instagram mobile/web APIs.
+
+        ``allow_network_fallbacks`` controls the secondary routes that reach out
+        to Instagram without the current session (clean unauthenticated retries
+        and HTML timeline scraping).  They exist to work around expired
+        sessions, but they cost extra requests, so tests and offline tooling
+        can disable them explicitly instead of the client guessing whether it
+        is running under a mock.
+        """
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": self.MOBILE_USER_AGENT,
@@ -47,6 +61,7 @@ class InstagramClient:
 
         self.cookies_file = cookies_file
         self.sessionid = sessionid
+        self.allow_network_fallbacks = allow_network_fallbacks
         self.restricted_profiles: Dict[str, str] = {}
 
         if cookies_file:
@@ -95,10 +110,17 @@ class InstagramClient:
 
     @staticmethod
     def shortcode_to_id(shortcode: str) -> int:
+        """Converts an Instagram shortcode into its numeric media id."""
         alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
         media_id = 0
         for char in shortcode:
-            media_id = (media_id * 64) + alphabet.index(char)
+            index = alphabet.find(char)
+            if index < 0:
+                raise ValueError(
+                    f"Invalid shortcode {shortcode!r}: character {char!r} is not a "
+                    "valid base64 shortcode character."
+                )
+            media_id = (media_id * 64) + index
         return media_id
 
     def check_profile_restriction(self, username: str) -> Optional[str]:
@@ -209,10 +231,9 @@ class InstagramClient:
                 if uid:
                     return uid
 
-            # If not found (e.g. redirected to homepage by expired session cookies)
-            # and not running under mock tests, retry with clean unauthenticated request
-            is_mock = hasattr(self.session.get, "assert_called")
-            if not is_mock:
+            # If not found (e.g. redirected to homepage by expired session cookies),
+            # retry with a clean unauthenticated request.
+            if self.allow_network_fallbacks:
                 try:
                     clean_resp = requests.get(url_html, headers=html_headers, timeout=10)
                     if clean_resp.status_code == 200:
@@ -243,13 +264,19 @@ class InstagramClient:
 
     def fetch_post_by_shortcode(self, shortcode: str) -> dict:
         """Fetches media info via mobile API, falling back to the post's HTML page."""
-        media_id = self.shortcode_to_id(shortcode)
+        try:
+            media_id = self.shortcode_to_id(shortcode)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"'{shortcode}' is not a valid Instagram shortcode, so it cannot be "
+                "downloaded. Pass a post URL or a valid shortcode."
+            ) from exc
         url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
         response = self.session.get(url, timeout=15)
         login_required = False
         if response.status_code == 200:
             try:
-                return self._parse_mobile_media_item(response.json()["items"][0])
+                return self.parse_media_item(response.json()["items"][0])
             except (KeyError, IndexError, ValueError):
                 pass  # Malformed response – fall through to HTML route
         else:
@@ -362,8 +389,7 @@ class InstagramClient:
             item = _search_script_blocks(html) if html else None
 
             # If session headers/cookies prevented SSR, retry with clean unauthenticated request
-            is_mock = hasattr(self.session.get, "assert_called")
-            if not item and not is_mock:
+            if not item and self.allow_network_fallbacks:
                 try:
                     clean_resp = requests.get(page_url, headers=headers, timeout=15)
                     if clean_resp.status_code == 200:
@@ -374,7 +400,7 @@ class InstagramClient:
                     pass
 
             if item:
-                return self._parse_mobile_media_item(item)
+                return self.parse_media_item(item)
 
             if not html:
                 continue
@@ -389,7 +415,7 @@ class InstagramClient:
                     data = json.loads(adl_match.group(1))
                     item = self._dig_for_media_item(data, shortcode)
                     if item:
-                        return self._parse_mobile_media_item(item)
+                        return self.parse_media_item(item)
                 except (json.JSONDecodeError, ValueError):
                     pass
 
@@ -401,11 +427,11 @@ class InstagramClient:
                     data = json.loads(candidate)
                     item = self._dig_for_media_item(data, shortcode)
                     if item:
-                        return self._parse_mobile_media_item(item)
+                        return self.parse_media_item(item)
                     # Maybe the blob IS the item itself
                     if "video_versions" in data or "video_url" in data:
                         data.setdefault("code", shortcode)
-                        return self._parse_mobile_media_item(data)
+                        return self.parse_media_item(data)
                 except (json.JSONDecodeError, ValueError):
                     continue
 
@@ -575,10 +601,9 @@ class InstagramClient:
                     break
             url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/"
             params = {"max_id": max_id} if max_id else {}
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, timeout=15)
             if response.status_code != 200:
-                is_mock = hasattr(self.session.get, "assert_called")
-                if pages_fetched == 0 and username and not is_mock:
+                if pages_fetched == 0 and username and self.allow_network_fallbacks:
                     timeline_items = list(self._fetch_profile_timeline_from_html(username))
                     if timeline_items:
                         for item in timeline_items:
@@ -623,7 +648,6 @@ class InstagramClient:
         max_id = None
         pages_fetched = 0
         total_items_yielded = 0
-        is_get_mock = hasattr(self.session.get, "assert_called")
         api_error_title = ""
         api_logout_reason = None
         api_status_code = 200
@@ -632,18 +656,11 @@ class InstagramClient:
             data = {"target_user_id": user_id, "page_size": 12}
             if max_id:
                 data["max_id"] = max_id
-            if is_get_mock:
-                response = self.session.get(
-                    "https://i.instagram.com/api/v1/clips/user/",
-                    params=data,
-                    timeout=15,
-                )
-            else:
-                response = self.session.post(
-                    "https://i.instagram.com/api/v1/clips/user/",
-                    data=data,
-                    timeout=15,
-                )
+            response = self.session.post(
+                "https://i.instagram.com/api/v1/clips/user/",
+                data=data,
+                timeout=15,
+            )
             api_status_code = response.status_code
             if response.status_code in (401, 403):
                 try:
@@ -653,8 +670,8 @@ class InstagramClient:
                 except Exception:
                     pass
 
-                # If not running under mock tests, attempt unauthenticated fallback
-                if not is_get_mock:
+                # Attempt an unauthenticated fallback for expired sessions.
+                if self.allow_network_fallbacks:
                     clean_headers = {
                         "User-Agent": self.MOBILE_USER_AGENT,
                         "Accept-Language": "en-US,en;q=0.9",
@@ -714,7 +731,7 @@ class InstagramClient:
                 pass
 
             # Fallback 2: Check profile timeline from HTML
-            if username and not is_get_mock:
+            if username and self.allow_network_fallbacks:
                 try:
                     html_items = list(self._fetch_profile_timeline_from_html(username))
                     found_any = False
@@ -1182,7 +1199,13 @@ class InstagramClient:
 
         return None, None, "Unknown"
 
-    def _parse_mobile_media_item(self, item: dict) -> dict:
+    def parse_media_item(self, item: dict) -> dict:
+        """Normalizes a raw Instagram media payload into Qivaryn's media dict.
+
+        Returns a dictionary with the ``shortcode``, ``media_type``,
+        ``timestamp``, ``video_url``, ``audio_url``, ``audio_start_ms``,
+        ``quality``, ``display_url`` and ``children`` keys.
+        """
         shortcode = item.get("code")
         media_type_code = item.get("media_type")
         timestamp = str(item.get("taken_at", ""))
@@ -1253,6 +1276,9 @@ class InstagramClient:
             "display_url": display_url,
             "children": children_media,
         }
+
+    # Backwards-compatible alias for the previous private method name.
+    _parse_mobile_media_item = parse_media_item
 
     @staticmethod
     def extract_shortcode_from_url(url_or_shortcode: str) -> str:

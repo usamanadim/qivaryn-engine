@@ -1,12 +1,15 @@
 import unittest
 from unittest.mock import MagicMock, patch
 from qivaryn.client import InstagramClient
-from qivaryn.downloader import QivarynEngine
 
 
 class TestAgeRestrictionAndSession(unittest.TestCase):
+    def setUp(self):
+        # Network fallbacks are disabled so the unit tests never reach the network.
+        self.client = InstagramClient(allow_network_fallbacks=False)
+
     def test_age_restricted_post_without_session(self):
-        client = InstagramClient()
+        client = self.client
 
         # Mobile API returns 403 login_required
         mock_mobile_resp = MagicMock()
@@ -25,7 +28,7 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
             self.assertIn("19+", str(ctx.exception))
 
     def test_age_restricted_post_with_logged_out_session(self):
-        client = InstagramClient(sessionid="fake_session_123")
+        client = InstagramClient(sessionid="fake_session_123", allow_network_fallbacks=False)
 
         # Mobile API returns 403 login_required with You've Been Logged Out
         mock_mobile_resp = MagicMock()
@@ -48,7 +51,7 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
             self.assertIn("age-restricted", str(ctx.exception).lower())
 
     def test_profile_gating_recorded_and_reported(self):
-        client = InstagramClient()
+        client = self.client
 
         # Mock HTML response for profile lookup containing gating data
         mock_html_resp = MagicMock()
@@ -69,7 +72,7 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
             self.assertIn("19 years old", client.restricted_profiles["restricted_user"])
 
     def test_age_restricted_bulk_reels_without_session(self):
-        client = InstagramClient()
+        client = self.client
         client.restricted_profiles["restricted_user"] = "Restricted profile: 19+ only"
 
         # Mock clips API returning empty items
@@ -77,14 +80,15 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
         mock_clips_resp.status_code = 200
         mock_clips_resp.json.return_value = {"items": [], "paging_info": {"more_available": False}}
 
-        with patch.object(client.session, "get", return_value=mock_clips_resp):
+        with patch.object(client.session, "post", return_value=mock_clips_resp), \
+             patch.object(client.session, "get", return_value=mock_clips_resp):
             with self.assertRaises(RuntimeError) as ctx:
                 list(client.fetch_user_raw_reels_paginated("98765", username="restricted_user"))
             self.assertIn("age-restricted", str(ctx.exception).lower())
             self.assertIn("active adult session", str(ctx.exception).lower())
 
     def test_age_restricted_bulk_reels_with_logged_out_session(self):
-        client = InstagramClient(sessionid="fake_session_123")
+        client = InstagramClient(sessionid="fake_session_123", allow_network_fallbacks=False)
         client.restricted_profiles["restricted_user"] = "Restricted profile: 19+ only"
 
         # Mock clips API returning 403 login_required
@@ -96,14 +100,15 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
             "logout_reason": 8,
         }
 
-        with patch.object(client.session, "get", return_value=mock_clips_resp):
+        with patch.object(client.session, "post", return_value=mock_clips_resp), \
+             patch.object(client.session, "get", return_value=mock_clips_resp):
             with self.assertRaises(RuntimeError) as ctx:
                 list(client.fetch_user_raw_reels_paginated("98765", username="restricted_user"))
             self.assertIn("logged out", str(ctx.exception).lower())
             self.assertIn("age-restricted", str(ctx.exception).lower())
 
     def test_age_restricted_bulk_reels_fallback_to_posts(self):
-        client = InstagramClient(sessionid="valid_session")
+        client = InstagramClient(sessionid="valid_session", allow_network_fallbacks=False)
 
         # Mock clips API returning empty items
         mock_clips_resp = MagicMock()
@@ -124,7 +129,8 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
             "more_available": False,
         }
 
-        with patch.object(client.session, "get", side_effect=[mock_clips_resp, mock_posts_resp]):
+        with patch.object(client.session, "post", return_value=mock_clips_resp), \
+             patch.object(client.session, "get", return_value=mock_posts_resp):
             items = list(client.fetch_user_raw_reels_paginated("98765", username="restricted_user"))
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["code"], "ReelFromFeed")

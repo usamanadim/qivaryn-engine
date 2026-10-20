@@ -6,10 +6,24 @@ PLATFORM_ENGINES = {
     "instagram": QivarynEngine,
 }
 
+
+def _looks_like_url(value: str) -> bool:
+    """Returns True when the argument should be treated as a URL rather than a command."""
+    lowered = value.lower()
+    return "://" in lowered or lowered.startswith("www.")
+
+
 class URLFallbackGroup(click.Group):
+    """Group that routes a bare URL argument to the hidden ``url`` command.
+
+    Unknown arguments that do not look like URLs are left alone so Click can
+    report "No such command" instead of a confusing platform error.
+    """
+
     def resolve_command(self, ctx, args):
         if args and args[0] not in self.commands and not args[0].startswith("-"):
-            return "url", self.commands["url"], args
+            if _looks_like_url(args[0]):
+                return "url", self.commands["url"], args
         return super().resolve_command(ctx, args)
 
 

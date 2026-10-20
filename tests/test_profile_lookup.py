@@ -8,7 +8,8 @@ from qivaryn.client import InstagramClient
 
 class ProfileLookupTests(unittest.TestCase):
     def setUp(self):
-        self.client = InstagramClient()
+        # Network fallbacks are disabled so the unit tests never reach the network.
+        self.client = InstagramClient(allow_network_fallbacks=False)
 
     def test_resolves_id_from_profile_api(self):
         response = MagicMock(status_code=200)

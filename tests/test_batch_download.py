@@ -24,7 +24,7 @@ class BatchDownloadTests(unittest.TestCase):
             for i in range(10)
         ]
         self.mock_client.fetch_user_raw_posts_paginated.return_value = raw_items
-        self.mock_client._parse_mobile_media_item.side_effect = lambda raw: {
+        self.mock_client.parse_media_item.side_effect = lambda raw: {
             "shortcode": raw["code"],
             "media_type": "Reel",
             "video_url": "http://example.com/v.mp4",
@@ -48,7 +48,7 @@ class BatchDownloadTests(unittest.TestCase):
             for i in range(10)
         ]
         self.mock_client.fetch_user_raw_posts_paginated.return_value = raw_items
-        self.mock_client._parse_mobile_media_item.side_effect = lambda raw: {
+        self.mock_client.parse_media_item.side_effect = lambda raw: {
             "shortcode": raw["code"],
             "media_type": "Reel",
             "video_url": "http://example.com/v.mp4",
@@ -82,7 +82,7 @@ class BatchDownloadTests(unittest.TestCase):
                 "timestamp": "2026-01-01",
                 "quality": "HQ",
             }
-        self.mock_client._parse_mobile_media_item.side_effect = parse_item
+        self.mock_client.parse_media_item.side_effect = parse_item
 
         with patch.object(self.engine, "_download_media_item", return_value=True) as mock_download:
             self.engine.download_account("testuser", media_type_filter="reels", count=2)
@@ -107,7 +107,7 @@ class BatchDownloadTests(unittest.TestCase):
                 "timestamp": "2026-01-01",
                 "quality": "HQ",
             }
-        self.mock_client._parse_mobile_media_item.side_effect = parse_item
+        self.mock_client.parse_media_item.side_effect = parse_item
 
         with patch.object(self.engine, "_download_media_item", return_value=True) as mock_download:
             self.engine.download_account("testuser", media_type_filter="carousels", count=2)
@@ -121,7 +121,7 @@ class BatchDownloadTests(unittest.TestCase):
             {"code": "REEL_2", "media_type": 2, "video_versions": []},
         ]
         self.mock_client.fetch_user_raw_posts_paginated.return_value = raw_items
-        self.mock_client._parse_mobile_media_item.return_value = {
+        self.mock_client.parse_media_item.return_value = {
             "shortcode": "REEL",
             "media_type": "Reel",
             "timestamp": "2026-01-01",

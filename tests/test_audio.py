@@ -1,6 +1,4 @@
 import unittest
-import shutil
-import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
@@ -115,7 +113,7 @@ class StreamMergeUnitTests(unittest.TestCase):
              patch("subprocess.run") as mock_run, \
              patch("os.path.exists", return_value=True), \
              patch("os.path.getsize", return_value=1024), \
-             patch("os.replace") as mock_replace:
+             patch("os.replace"):
             mock_run.return_value = MagicMock(returncode=0)
             success = self.engine._download_video_stream(
                 video_url="https://cdn.example/v.mp4",

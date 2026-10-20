@@ -1,6 +1,9 @@
 import sqlite3
 import os
-from typing import Optional, Set
+from contextlib import contextmanager
+from typing import Iterator, Optional, Set
+
+from .files import file_is_present
 
 class StateDatabase:
     """Manages SQLite state persistence with WAL mode and in-memory set caching for instantaneous lookups."""
@@ -9,9 +12,23 @@ class StateDatabase:
         self._downloaded_cache: Set[str] = set()
         self._init_db()
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Opens a connection and always closes it.
+
+        ``with sqlite3.connect(...)`` only commits the transaction; it leaves the
+        connection (and therefore the database file lock) open.  Closing
+        explicitly keeps the state database from locking files on disk.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def _init_db(self):
         os.makedirs(os.path.dirname(os.path.abspath(self.db_path)) or ".", exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS downloaded_media (
@@ -36,7 +53,7 @@ class StateDatabase:
 
     def reload_cache(self):
         """Synchronizes in-memory cache with SQLite database."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT shortcode FROM downloaded_media")
             self._downloaded_cache = {row[0] for row in cursor.fetchall()}
@@ -47,7 +64,7 @@ class StateDatabase:
 
     def get_file_path(self, shortcode: str) -> Optional[str]:
         """Retrieves stored file path for a downloaded item."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT file_path FROM downloaded_media WHERE shortcode = ?", (shortcode,))
             row = cursor.fetchone()
@@ -60,7 +77,7 @@ class StateDatabase:
     def mark_downloaded(self, shortcode: str, media_type: str, timestamp: str, file_path: str):
         """Records successfully downloaded items in SQLite and active in-memory cache."""
         self._downloaded_cache.add(shortcode)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO downloaded_media (shortcode, media_type, timestamp, file_path)
                 VALUES (?, ?, ?, ?)
@@ -69,7 +86,7 @@ class StateDatabase:
 
     def get_cached_user_id(self, username: str) -> Optional[str]:
         """Retrieves user ID from local SQLite cache."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM cached_users WHERE username = ?", (username.lower(),))
             row = cursor.fetchone()
@@ -77,7 +94,7 @@ class StateDatabase:
 
     def cache_user_id(self, username: str, user_id: str):
         """Caches user ID locally to avoid redundant profile API requests."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO cached_users (username, user_id)
                 VALUES (?, ?)
@@ -87,7 +104,7 @@ class StateDatabase:
     def remove_record(self, shortcode: str) -> bool:
         """Removes a specific shortcode record from database and in-memory cache without touching media files."""
         self._downloaded_cache.discard(shortcode)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM downloaded_media WHERE shortcode = ?", (shortcode,))
             conn.commit()
@@ -97,7 +114,7 @@ class StateDatabase:
         """Clears all media download history records from database without deleting media files."""
         count = len(self._downloaded_cache)
         self._downloaded_cache.clear()
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM downloaded_media")
             if clear_user_cache:
@@ -112,21 +129,22 @@ class StateDatabase:
     def prune_missing(self, base_output_dir: Optional[str] = None) -> int:
         """Scans database records and removes entries whose media files were deleted from disk."""
         removed_count = 0
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT shortcode, file_path FROM downloaded_media")
             rows = cursor.fetchall()
 
             for shortcode, file_path in rows:
                 is_present = False
-                if file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                if file_path and file_path != "carousel_bundle" and file_is_present(file_path):
                     is_present = True
                 elif base_output_dir and os.path.exists(base_output_dir):
-                    for ext in [".mp4", ".jpg", ".jpeg", ".webp"]:
+                    # Carousel bundles are recorded without a concrete path, so fall
+                    # back to probing the output directory for their slides.
+                    for ext in (".mp4", ".jpg", ".jpeg", ".webp"):
                         cand = os.path.join(base_output_dir, f"{shortcode}{ext}")
                         cand_carousel = os.path.join(base_output_dir, f"{shortcode}_1{ext}")
-                        if (os.path.exists(cand) and os.path.getsize(cand) > 0) or \
-                           (os.path.exists(cand_carousel) and os.path.getsize(cand_carousel) > 0):
+                        if file_is_present(cand) or file_is_present(cand_carousel):
                             is_present = True
                             break
 
