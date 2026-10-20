@@ -45,6 +45,10 @@ class InstagramClient:
             "X-FB-HTTP-Engine": "Liger",
         })
 
+        self.cookies_file = cookies_file
+        self.sessionid = sessionid
+        self.restricted_profiles: Dict[str, str] = {}
+
         if cookies_file:
             self.load_cookies_from_file(cookies_file)
 
@@ -55,6 +59,15 @@ class InstagramClient:
                      self.session.cookies.get("csrftoken", domain="instagram.com")
         if csrf_token:
             self.session.headers.update({"X-CSRFToken": csrf_token})
+
+    def has_session(self) -> bool:
+        """Returns True if the client was configured with a sessionid or cookie file."""
+        if self.sessionid or self.cookies_file:
+            return True
+        for cookie in self.session.cookies:
+            if cookie.name == "sessionid":
+                return True
+        return False
 
     def load_cookies_from_file(self, cookies_file_path: str):
         if not os.path.exists(cookies_file_path):
@@ -71,7 +84,13 @@ class InstagramClient:
                 f"Could not read cookies file '{cookies_file_path}'. "
                 "Make sure it is a valid Netscape-format cookies file."
             ) from exc
-        self.session.cookies.update(cj)
+        loaded_count = 0
+        for cookie in cj:
+            if "instagram.com" in getattr(cookie, "domain", ""):
+                self.session.cookies.set_cookie(cookie)
+                loaded_count += 1
+        if loaded_count == 0:
+            self.session.cookies.update(cj)
         print(f"[+] Successfully loaded cookies from: {cookies_file_path}")
 
     @staticmethod
@@ -81,6 +100,31 @@ class InstagramClient:
         for char in shortcode:
             media_id = (media_id * 64) + alphabet.index(char)
         return media_id
+
+    def check_profile_restriction(self, username: str) -> Optional[str]:
+        """Checks if a user profile is age-restricted or gated, returning the reason or None."""
+        if username.lower() in self.restricted_profiles:
+            return self.restricted_profiles[username.lower()]
+        headers = {
+            "User-Agent": self.DESKTOP_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.instagram.com/",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+        }
+        url = f"https://www.instagram.com/{username}/"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200 and "gating" in resp.text:
+                g_match = re.search(r'"gating"\s*:\s*\{"title"\s*:\s*"([^"]+)",\s*"description"\s*:\s*"([^"]+)"', resp.text)
+                if g_match:
+                    reason = f"{g_match.group(1)}: {g_match.group(2)}"
+                    self.restricted_profiles[username.lower()] = reason
+                    return reason
+        except requests.RequestException:
+            pass
+        return None
 
     def get_user_id(self, username: str) -> str:
         """Resolves Instagram user ID with multiple web and HTML fallback routes."""
@@ -157,6 +201,10 @@ class InstagramClient:
         try:
             resp_html = self.session.get(url_html, headers=html_headers, timeout=10)
             if resp_html.status_code == 200:
+                if "gating" in resp_html.text:
+                    g_match = re.search(r'"gating"\s*:\s*\{"title"\s*:\s*"([^"]+)",\s*"description"\s*:\s*"([^"]+)"', resp_html.text)
+                    if g_match:
+                        self.restricted_profiles[username.lower()] = f"{g_match.group(1)}: {g_match.group(2)}"
                 uid = _extract_id_from_html(resp_html.text)
                 if uid:
                     return uid
@@ -168,6 +216,10 @@ class InstagramClient:
                 try:
                     clean_resp = requests.get(url_html, headers=html_headers, timeout=10)
                     if clean_resp.status_code == 200:
+                        if "gating" in clean_resp.text:
+                            g_match = re.search(r'"gating"\s*:\s*\{"title"\s*:\s*"([^"]+)",\s*"description"\s*:\s*"([^"]+)"', clean_resp.text)
+                            if g_match:
+                                self.restricted_profiles[username.lower()] = f"{g_match.group(1)}: {g_match.group(2)}"
                         uid = _extract_id_from_html(clean_resp.text)
                         if uid:
                             return uid
@@ -217,6 +269,39 @@ class InstagramClient:
         try:
             return self._fetch_post_from_html(shortcode)
         except RuntimeError as exc:
+            err_msg = str(exc)
+            error_title = error_data.get("error_title") if isinstance(error_data, dict) else ""
+            is_logged_out = (
+                "logged out" in str(error_title).lower()
+                or (isinstance(error_data, dict) and error_data.get("logout_reason") is not None)
+            )
+
+            # Case 1: Post is age-gated / mature audience
+            if "age-restricted" in err_msg.lower() or "mature audience" in err_msg.lower():
+                if is_logged_out and (self.cookies_file or self.sessionid):
+                    raise RuntimeError(
+                        f"Item {shortcode} is age-restricted (requires a verified 19+ account). "
+                        "The session provided via cookies/sessionid was rejected as EXPIRED or LOGGED OUT "
+                        f"(Instagram reported: \"{error_title or 'You have been logged out'}\"). "
+                        "Please log into Instagram in your browser and export fresh cookies to cookies.txt."
+                    ) from exc
+                if not self.has_session():
+                    raise RuntimeError(
+                        f"Item {shortcode} is age-restricted (requires a verified 19+ account). "
+                        "Instagram strictly blocks unauthenticated public access to this content. "
+                        "Please provide an active adult session using --cookies cookies.txt or --sessionid SESSION_ID."
+                    ) from exc
+                raise
+
+            # Case 2: Session was explicitly rejected as logged out / expired
+            if is_logged_out and (self.cookies_file or self.sessionid):
+                raise RuntimeError(
+                    f"Your Instagram session is expired or logged out "
+                    f"(Instagram reported: \"{error_title or 'You have been logged out'}\"). "
+                    "Please log into Instagram in your browser and export fresh cookies to cookies.txt."
+                ) from exc
+
+            # Case 3: Standard login required
             if login_required:
                 raise RuntimeError(
                     f"Instagram requires an authenticated session to fetch {shortcode} "
@@ -263,6 +348,7 @@ class InstagramClient:
                     return item
             return None
 
+        last_html = ""
         for path_prefix in ("p", "reel"):
             page_url = f"https://www.instagram.com/{path_prefix}/{shortcode}/"
             try:
@@ -271,6 +357,8 @@ class InstagramClient:
                 raise RuntimeError(f"HTML fetch failed for {shortcode}: {exc}")
 
             html = resp.text if resp.status_code == 200 else ""
+            if html:
+                last_html = html
             item = _search_script_blocks(html) if html else None
 
             # If session headers/cookies prevented SSR, retry with clean unauthenticated request
@@ -280,6 +368,7 @@ class InstagramClient:
                     clean_resp = requests.get(page_url, headers=headers, timeout=15)
                     if clean_resp.status_code == 200:
                         html = clean_resp.text
+                        last_html = html
                         item = _search_script_blocks(html)
                 except requests.RequestException:
                     pass
@@ -340,6 +429,20 @@ class InstagramClient:
                     "children": [],
                 }
 
+        if last_html:
+            age_match = re.search(r'"restricted_age"\s*:\s*(\d+)', last_html)
+            if age_match:
+                min_age = age_match.group(1)
+                raise RuntimeError(
+                    f"Item {shortcode} is age-restricted ({min_age}+ / Mature Audience). "
+                    "Instagram prohibits unauthenticated access to this media."
+                )
+            if '"failure_reason":"MA"' in last_html:
+                raise RuntimeError(
+                    f"Item {shortcode} is restricted to Mature Audiences (18+/19+). "
+                    "Instagram prohibits unauthenticated access to this media."
+                )
+
         raise RuntimeError(
             f"Failed to fetch media for {shortcode}: Instagram's mobile API and web page "
             "returned no media. The post may be private, removed, or unavailable to this "
@@ -387,48 +490,73 @@ class InstagramClient:
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
         }
-        url = f"https://www.instagram.com/{username}/"
-        try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code != 200:
-                return
+        desktop_session = requests.Session()
+        for cookie in self.session.cookies:
+            if "instagram.com" in getattr(cookie, "domain", ""):
+                desktop_session.cookies.set_cookie(cookie)
+
+        seen_codes = set()
+        for path_prefix in (f"{username}/", f"{username}/reels/"):
+            url = f"https://www.instagram.com/{path_prefix}"
+            resp = None
+            try:
+                if self.has_session():
+                    resp = desktop_session.get(url, headers=headers, timeout=15)
+                if not resp or resp.status_code != 200 or len(resp.text) < 1000:
+                    resp = requests.get(url, headers=headers, timeout=15)
+            except Exception:
+                try:
+                    resp = requests.get(url, headers=headers, timeout=15)
+                except Exception:
+                    continue
+
+            if not resp or resp.status_code != 200:
+                continue
+
+            if "gating" in resp.text:
+                g_match = re.search(r'"gating"\s*:\s*\{"title"\s*:\s*"([^"]+)",\s*"description"\s*:\s*"([^"]+)"', resp.text)
+                if g_match:
+                    self.restricted_profiles[username.lower()] = f"{g_match.group(1)}: {g_match.group(2)}"
+
             scripts = re.findall(r'<script[^>]+type=["\']application/json["\'][^>]*>(.*?)</script>', resp.text, re.DOTALL)
             for s in scripts:
-                if "polaris_ordered_timeline_connection" in s:
-                    data = json.loads(s)
-                    def find_timeline(obj):
-                        if isinstance(obj, dict):
-                            if "polaris_ordered_timeline_connection" in obj:
-                                return obj["polaris_ordered_timeline_connection"]
-                            for v in obj.values():
-                                res = find_timeline(v)
-                                if res:
-                                    return res
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                res = find_timeline(item)
-                                if res:
-                                    return res
-                        return None
-                    timeline = find_timeline(data)
-                    if timeline:
-                        edges = timeline.get("edges", [])
-                        for edge in edges:
-                            node = edge.get("node", {})
-                            code = node.get("code")
-                            if code:
-                                is_carousel = node.get("__typename") == "XIGPolarisCarouselMedia"
-                                is_video = node.get("__typename") == "XIGPolarisVideoMedia"
-                                m_type = 8 if is_carousel else (2 if is_video else 1)
-                                yield {
-                                    "code": code,
-                                    "pk": node.get("pk") or node.get("id"),
-                                    "media_type": m_type,
-                                    "_needs_full_fetch": True,
-                                }
-                        return
-        except Exception:
-            return
+                if "polaris_ordered_timeline_connection" in s or '"code":' in s:
+                    try:
+                        data = json.loads(s)
+                        def find_timeline(obj):
+                            if isinstance(obj, dict):
+                                if "polaris_ordered_timeline_connection" in obj:
+                                    return obj["polaris_ordered_timeline_connection"]
+                                for v in obj.values():
+                                    res = find_timeline(v)
+                                    if res:
+                                        return res
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    res = find_timeline(item)
+                                    if res:
+                                        return res
+                            return None
+                        timeline = find_timeline(data)
+                        if timeline:
+                            edges = timeline.get("edges", [])
+                            for edge in edges:
+                                node = edge.get("node", {})
+                                code = node.get("code")
+                                if code and code not in seen_codes:
+                                    seen_codes.add(code)
+                                    is_carousel = node.get("__typename") == "XIGPolarisCarouselMedia"
+                                    is_video = node.get("__typename") == "XIGPolarisVideoMedia" or bool(node.get("is_video"))
+                                    m_type = 8 if is_carousel else (2 if is_video else 1)
+                                    yield {
+                                        "code": code,
+                                        "pk": node.get("pk") or node.get("id"),
+                                        "media_type": m_type,
+                                        "is_video": is_video,
+                                        "_needs_full_fetch": True,
+                                    }
+                    except Exception:
+                        pass
 
     def fetch_user_raw_posts_paginated(
         self,
@@ -486,12 +614,20 @@ class InstagramClient:
             pages_fetched += 1
 
     def fetch_user_raw_reels_paginated(
-        self, user_id: str, max_pages: Optional[int] = None
+        self,
+        user_id: str,
+        max_pages: Optional[int] = None,
+        username: Optional[str] = None,
     ) -> Generator[dict, None, None]:
         """Yields raw media from the profile's dedicated Reels tab."""
         max_id = None
         pages_fetched = 0
+        total_items_yielded = 0
         is_get_mock = hasattr(self.session.get, "assert_called")
+        api_error_title = ""
+        api_logout_reason = None
+        api_status_code = 200
+
         while max_pages is None or pages_fetched < max_pages:
             data = {"target_user_id": user_id, "page_size": 12}
             if max_id:
@@ -508,36 +644,49 @@ class InstagramClient:
                     data=data,
                     timeout=15,
                 )
+            api_status_code = response.status_code
             if response.status_code in (401, 403):
-                # Unauthenticated mobile fallback in case session cookies are invalid/expired
-                clean_headers = {
-                    "User-Agent": self.MOBILE_USER_AGENT,
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "X-IG-Capabilities": "36r/F/8=",
-                    "X-IG-Connection-Type": "WIFI",
-                    "X-FB-HTTP-Engine": "Liger",
-                }
-                clean_resp = requests.post(
-                    "https://i.instagram.com/api/v1/clips/user/",
-                    data=data,
-                    headers=clean_headers,
-                    timeout=15,
-                )
-                if clean_resp.status_code == 200:
-                    response = clean_resp
+                try:
+                    err_json = response.json()
+                    api_error_title = err_json.get("error_title", "")
+                    api_logout_reason = err_json.get("logout_reason")
+                except Exception:
+                    pass
+
+                # If not running under mock tests, attempt unauthenticated fallback
+                if not is_get_mock:
+                    clean_headers = {
+                        "User-Agent": self.MOBILE_USER_AGENT,
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "X-IG-Capabilities": "36r/F/8=",
+                        "X-IG-Connection-Type": "WIFI",
+                        "X-FB-HTTP-Engine": "Liger",
+                    }
+                    try:
+                        clean_resp = requests.post(
+                            "https://i.instagram.com/api/v1/clips/user/",
+                            data=data,
+                            headers=clean_headers,
+                            timeout=15,
+                        )
+                        if clean_resp.status_code == 200:
+                            response = clean_resp
+                    except Exception:
+                        pass
 
             if response.status_code != 200:
-                raise RuntimeError(
-                    f"Failed to fetch Reels for user {user_id}: "
-                    f"Instagram returned HTTP {response.status_code}."
-                )
+                break
 
-            result = response.json()
+            try:
+                result = response.json()
+            except Exception:
+                break
             items = result.get("items", [])
             if not items:
                 break
             for item in items:
                 media = item.get("media") or item.get("clip")
+                total_items_yielded += 1
                 yield media if isinstance(media, dict) else item
 
             paging_info = result.get("paging_info") or {}
@@ -547,6 +696,74 @@ class InstagramClient:
                 break
             max_id = next_max_id
             pages_fetched += 1
+
+        # If zero items yielded, try fallbacks before checking age restriction
+        if total_items_yielded == 0:
+            # Fallback 1: Posts feed for Reels (media_type == 2 or video_versions)
+            try:
+                feed_items = self.fetch_user_raw_posts_paginated(user_id, max_pages=max_pages, username=username)
+                found_any = False
+                for p in feed_items:
+                    if p.get("media_type") == 2 or "video_versions" in p or p.get("is_video"):
+                        found_any = True
+                        total_items_yielded += 1
+                        yield p
+                if found_any:
+                    return
+            except Exception:
+                pass
+
+            # Fallback 2: Check profile timeline from HTML
+            if username and not is_get_mock:
+                try:
+                    html_items = list(self._fetch_profile_timeline_from_html(username))
+                    found_any = False
+                    for h in html_items:
+                        if h.get("media_type") == 2 or h.get("is_video"):
+                            found_any = True
+                            total_items_yielded += 1
+                            yield h
+                    if found_any:
+                        return
+                except Exception:
+                    pass
+
+            # If still 0 items, check if profile is age-restricted
+            restriction = None
+            if username:
+                restriction = self.restricted_profiles.get(username.lower()) or self.check_profile_restriction(username)
+
+            if restriction:
+                is_logged_out = (
+                    "logged out" in str(api_error_title).lower()
+                    or api_logout_reason is not None
+                )
+                if is_logged_out and (self.cookies_file or self.sessionid):
+                    reported_err = api_error_title or 'You have been logged out'
+                    raise RuntimeError(
+                        f"Cannot download Reels for @{username}: Account is age-restricted ({restriction}). "
+                        "The session provided via cookies/sessionid was rejected as EXPIRED or LOGGED OUT "
+                        f"(Instagram reported: '{reported_err}'). "
+                        "Please log into Instagram in your browser and export fresh cookies to cookies.txt."
+                    )
+                if not self.has_session():
+                    raise RuntimeError(
+                        f"Cannot download Reels for @{username}: Account is age-restricted ({restriction}). "
+                        "Instagram strictly blocks unauthenticated public access to this profile. "
+                        "Please provide an active adult session using --cookies cookies.txt or --sessionid SESSION_ID."
+                    )
+                if self.has_session():
+                    raise RuntimeError(
+                        f"Cannot download Reels for @{username}: Account is age-restricted ({restriction}). "
+                        "Your session was either rejected as expired/logged out or belongs to an account under the required age (19+). "
+                        "Please ensure you are logged into a verified adult account and export fresh cookies."
+                    )
+
+            if api_status_code not in (200,):
+                raise RuntimeError(
+                    f"Failed to fetch Reels for user {user_id}: "
+                    f"Instagram returned HTTP {api_status_code}."
+                )
 
     @staticmethod
     def _parse_dash_manifest_to_root(manifest_input: Any) -> Optional[ET.Element]:

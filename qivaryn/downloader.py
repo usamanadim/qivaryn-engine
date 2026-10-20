@@ -238,64 +238,83 @@ class QivarynEngine:
         except Exception:
             items_gen = fetch_items(user_id, max_pages=max_pages)
 
-        for raw_item in items_gen:
-            if count is not None and total_downloaded >= count:
-                break
+        try:
+            for raw_item in items_gen:
+                if count is not None and total_downloaded >= count:
+                    break
 
-            shortcode = raw_item.get("code")
-            if not shortcode:
-                continue
-
-            # Pre-filter media types directly from raw metadata before parsing heavy XML/DASH trees
-            raw_media_type = raw_item.get("media_type")
-            if filter_mode in ("reels", "videos") and raw_media_type != 2 and "video_versions" not in raw_item:
-                continue
-            if filter_mode == "carousels" and raw_media_type != 8 and "carousel_media" not in raw_item:
-                continue
-            if filter_mode == "posts" and raw_media_type == 2:
-                continue
-
-            # ZERO-OVERHEAD SKIP: Check in-memory state before ANY parsing or network calls
-            if not force and (shortcode in known_shortcodes or self._is_item_already_saved(shortcode)):
-                skipped_existing += 1
-                if count is None:
-                    consecutive_known_count += 1
-                    if consecutive_known_count >= self.consecutive_threshold:
-                        print(f"\n[>>] Early-Exit threshold reached ({self.consecutive_threshold} consecutive known items). Resumption complete instantly!")
-                        break
-                continue
-            else:
-                consecutive_known_count = 0
-
-            # Parse and extract media info
-            if raw_item.get("_needs_full_fetch"):
-                try:
-                    post = self.client.fetch_post_by_shortcode(shortcode)
-                except Exception as exc:
-                    print(f"[-] Could not fetch full details for {shortcode}: {exc}")
+                shortcode = raw_item.get("code")
+                if not shortcode:
                     continue
-            else:
-                post = self.client._parse_mobile_media_item(raw_item)
-            m_type = post["media_type"]
 
-            if filter_mode in ("reels", "videos") and m_type != "Reel":
-                continue
-            if filter_mode == "carousels" and m_type != "Carousel":
-                continue
-            if filter_mode == "posts" and m_type == "Reel":
-                continue
+                # Pre-filter media types directly from raw metadata before parsing heavy XML/DASH trees
+                raw_media_type = raw_item.get("media_type")
+                if filter_mode in ("reels", "videos") and raw_media_type != 2 and "video_versions" not in raw_item:
+                    continue
+                if filter_mode == "carousels" and raw_media_type != 8 and "carousel_media" not in raw_item:
+                    continue
+                if filter_mode == "posts" and raw_media_type == 2:
+                    continue
 
-            if self._download_media_item(post, force=force):
-                total_downloaded += 1
-                known_shortcodes.add(shortcode)
-                if count is not None:
-                    print(f"    [Batch Progress] {total_downloaded}/{count} new items downloaded.")
-                    if total_downloaded >= count:
-                        print(f"\n[+] Successfully reached target of {count} new items!")
-                        break
+                # ZERO-OVERHEAD SKIP: Check in-memory state before ANY parsing or network calls
+                if not force and (shortcode in known_shortcodes or self._is_item_already_saved(shortcode)):
+                    skipped_existing += 1
+                    if count is None:
+                        consecutive_known_count += 1
+                        if consecutive_known_count >= self.consecutive_threshold:
+                            print(f"\n[>>] Early-Exit threshold reached ({self.consecutive_threshold} consecutive known items). Resumption complete instantly!")
+                            break
+                    continue
+                else:
+                    consecutive_known_count = 0
+
+                # Parse and extract media info
+                if raw_item.get("_needs_full_fetch"):
+                    try:
+                        post = self.client.fetch_post_by_shortcode(shortcode)
+                    except Exception as exc:
+                        print(f"[-] Could not fetch full details for {shortcode}: {exc}")
+                        continue
+                else:
+                    post = self.client._parse_mobile_media_item(raw_item)
+                m_type = post["media_type"]
+
+                if filter_mode in ("reels", "videos") and m_type != "Reel":
+                    continue
+                if filter_mode == "carousels" and m_type != "Carousel":
+                    continue
+                if filter_mode == "posts" and m_type == "Reel":
+                    continue
+
+                if self._download_media_item(post, force=force):
+                    total_downloaded += 1
+                    known_shortcodes.add(shortcode)
+                    if count is not None:
+                        print(f"    [Batch Progress] {total_downloaded}/{count} new items downloaded.")
+                        if total_downloaded >= count:
+                            print(f"\n[+] Successfully reached target of {count} new items!")
+                            break
+        except RuntimeError as exc:
+            print(f"\n[-] Failed to fetch {feed_name} for @{username}: {exc}")
+            return total_downloaded
 
         skip_str = f" ({skipped_existing} previously downloaded items skipped)" if skipped_existing > 0 else ""
-        print(f"\n[+] Download session complete! Downloaded {total_downloaded} new items{skip_str} for @{username}.")
+        if total_downloaded > 0 or skipped_existing > 0:
+            print(f"\n[+] Download session complete! Downloaded {total_downloaded} new items{skip_str} for @{username}.")
+        elif total_downloaded == 0 and skipped_existing == 0:
+            restriction = getattr(self.client, "restricted_profiles", {}).get(username.lower())
+            if not restriction and hasattr(self.client, "check_profile_restriction"):
+                restriction = self.client.check_profile_restriction(username)
+            if restriction:
+                print(f"\n[-] Failed to download content for @{username}: Profile is age-restricted / gated ({restriction}).")
+                print("    Instagram blocks unauthenticated and anonymous requests to this profile.")
+                if self.client.has_session():
+                    print("    Your session was either rejected as expired/logged out or belongs to an account under the required age.")
+                    print("    Please log into Instagram with an adult (19+) account in your browser and export fresh cookies.")
+                else:
+                    print("    An active adult session (19+) is required. Retry with --cookies cookies.txt or --sessionid SESSION_ID.")
+            else:
+                print(f"\n[!] No downloadable items found for @{username} matching filter '{filter_mode}'.")
         return total_downloaded
 
     def _download_media_item(self, post: dict, force: bool = False) -> bool:
