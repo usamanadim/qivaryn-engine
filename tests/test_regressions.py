@@ -2,6 +2,7 @@
 
 import inspect
 import os
+import re
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -235,6 +236,35 @@ class EngineStateTests(unittest.TestCase):
             handle.write(b"")
 
         self.assertFalse(engine._is_item_already_saved("CODE"))
+
+
+class VersionConsistencyTests(unittest.TestCase):
+    """The package metadata and the runtime version must never drift apart."""
+
+    def test_pyproject_version_matches_package_version(self):
+        import qivaryn
+
+        pyproject = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "pyproject.toml",
+        )
+        with open(pyproject, "r", encoding="utf-8") as handle:
+            content = handle.read()
+
+        match = re.search(r'^version\s*=\s*"([^"]+)"', content, re.MULTILINE)
+        self.assertIsNotNone(match, "Could not find a version in pyproject.toml")
+        self.assertEqual(match.group(1), qivaryn.__version__)
+
+    def test_distribution_metadata_matches_package_version(self):
+        import qivaryn
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            installed = version("qivaryn-engine")
+        except PackageNotFoundError:
+            self.skipTest("qivaryn-engine is not installed in this environment")
+
+        self.assertEqual(installed, qivaryn.__version__)
 
 
 if __name__ == "__main__":

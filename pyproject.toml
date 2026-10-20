@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qivaryn-engine"
-version = "0.1.1"
+version = "0.1.2"
 description = "A media download engine designed for multiple platforms, currently supporting Instagram."
 readme = "README.md"
 requires-python = ">=3.8"
