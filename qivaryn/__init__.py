@@ -4,5 +4,5 @@ from .database import StateDatabase
 
 InstagramEngine = QivarynEngine
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = ["QivarynEngine", "InstagramEngine", "InstagramClient", "StateDatabase"]

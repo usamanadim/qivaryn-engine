@@ -1,15 +1,14 @@
 [build-system]
-requires = ["setuptools>=77.0.0"]
+requires = ["setuptools>=61.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "qivaryn-engine"
-version = "0.1.2"
+version = "0.1.3"
 description = "A media download engine designed for multiple platforms, currently supporting Instagram."
 readme = "README.md"
 requires-python = ">=3.8"
-license = "LicenseRef-Qivaryn-Attribution-1.0"
-license-files = ["LICENSE"]
+license = { file = "LICENSE" }
 authors = [
     { name = "Usama Nadeem (@usamanadim)" }
 ]
