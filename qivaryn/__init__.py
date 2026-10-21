@@ -1,8 +1,17 @@
-from .downloader import QivarynEngine
 from .client import InstagramClient
 from .database import StateDatabase
+from .downloader import QivarynEngine
+from .platforms import FacebookClient, TikTokClient, YouTubeClient
 
 InstagramEngine = QivarynEngine
 
-__version__ = "0.1.3"
-__all__ = ["QivarynEngine", "InstagramEngine", "InstagramClient", "StateDatabase"]
+__version__ = "0.2.0"
+__all__ = [
+    "QivarynEngine",
+    "InstagramEngine",
+    "InstagramClient",
+    "TikTokClient",
+    "YouTubeClient",
+    "FacebookClient",
+    "StateDatabase",
+]

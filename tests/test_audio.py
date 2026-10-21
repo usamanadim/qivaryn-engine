@@ -129,6 +129,39 @@ class StreamMergeUnitTests(unittest.TestCase):
             self.assertIn("-ss", cmd)
             self.assertIn("1.500", cmd)
 
+    def test_a_short_audio_track_aborts_the_merge(self):
+        def duration(path):
+            return 758.0 if ".temp_v." in path else 707.0
+
+        with patch.object(self.engine, "_download_file", return_value=True), \
+             patch("shutil.which", return_value="ffmpeg"), \
+             patch.object(self.engine, "_media_duration", side_effect=duration), \
+             patch.object(self.engine, "_run_ffmpeg") as ffmpeg:
+            success = self.engine._download_video_stream(
+                video_url="https://cdn.example/v.mp4",
+                audio_url="https://cdn.example/a.m4a",
+                file_path=self.output_path,
+                desc="test reel",
+            )
+
+        self.assertFalse(success)
+        ffmpeg.assert_not_called()
+
+    def test_matching_track_lengths_are_merged(self):
+        with patch.object(self.engine, "_download_file", return_value=True), \
+             patch("shutil.which", return_value="ffmpeg"), \
+             patch.object(self.engine, "_media_duration", return_value=758.0), \
+             patch.object(self.engine, "_run_ffmpeg") as ffmpeg:
+            ffmpeg.return_value = MagicMock(returncode=1)
+            self.engine._download_video_stream(
+                video_url="https://cdn.example/v.mp4",
+                audio_url="https://cdn.example/a.m4a",
+                file_path=self.output_path,
+                desc="test reel",
+            )
+
+        ffmpeg.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()

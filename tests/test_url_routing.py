@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from qivaryn.client import InstagramClient
 from qivaryn.downloader import QivarynEngine
@@ -54,19 +54,26 @@ class InstagramReelsFeedTests(unittest.TestCase):
             "max_id": "next-page",
         })
 
-    def test_account_url_combines_post_and_reels_counts(self):
+    def test_account_url_splits_the_count_across_feeds(self):
+        from qivaryn.platforms.base import AccountFeed
+
         engine = QivarynEngine.__new__(QivarynEngine)
-        with patch.object(engine, "download_account", return_value=4) as posts, \
-             patch.object(engine, "download_account_reels", return_value=1) as reels:
-            downloaded = engine.download_account_content("alice", count=5)
+        engine.platform = "instagram"
+        engine.client = MagicMock()
+        engine.client.feeds_for.return_value = (
+            AccountFeed("account feed", "posts", MagicMock()),
+            AccountFeed("Reels tab", "reels", MagicMock()),
+        )
+        engine.client.account_label.return_value = "@alice"
+        engine.db = MagicMock()
+        engine.db.get_cached_user_id.return_value = "123"
+        engine._download_feed = MagicMock(side_effect=[(4, 0), (1, 0)])
+
+        downloaded = engine.download_account_content("alice", count=5)
 
         self.assertEqual(downloaded, 5)
-        posts.assert_called_once_with(
-            "alice", media_type_filter="posts", max_pages=None, force=False, count=5
-        )
-        reels.assert_called_once_with(
-            "alice", max_pages=None, force=False, count=1
-        )
+        counts = [call.kwargs["count"] for call in engine._download_feed.call_args_list]
+        self.assertEqual(counts, [5, 1])
 
 
 if __name__ == "__main__":

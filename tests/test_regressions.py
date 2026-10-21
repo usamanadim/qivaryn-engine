@@ -83,27 +83,33 @@ class PublicMediaParsingTests(unittest.TestCase):
     def test_private_alias_remains_available(self):
         self.assertIs(InstagramClient._parse_mobile_media_item, InstagramClient.parse_media_item)
 
-    def test_downloader_calls_the_public_method(self):
+    def test_downloader_calls_the_platform_normalization_hook(self):
         engine = QivarynEngine.__new__(QivarynEngine)
-        engine.db = MagicMock()
+        engine.platform = "instagram"
         engine.output_dir = "./downloads"
-        engine.consecutive_threshold = 3
-        engine.db.get_cached_user_id.return_value = "12345"
+        engine.db = MagicMock()
         engine.db.get_all_downloaded_shortcodes.return_value = set()
+        engine.consecutive_threshold = 3
         engine.client = MagicMock()
-        engine.client.parse_media_item.return_value = {"shortcode": "X", "media_type": "Reel"}
-        engine.client.fetch_user_raw_posts_paginated.return_value = [
-            {"code": "X", "media_type": 2, "video_versions": [{"url": "http://example.com/v.mp4"}]}
-        ]
+        engine.client.item_id.return_value = "X"
+        engine.client.prefilter.return_value = True
+        engine.client.matches_filter.return_value = True
+        engine.client.normalize_item.return_value = {"id": "X", "media_type": "Reel"}
 
+        raw = {"code": "X", "media_type": 2}
         with patch.object(engine, "_download_media_item", return_value=True):
-            engine._download_account_feed(
-                "user",
-                engine.client.fetch_user_raw_posts_paginated,
-                count=1,
-            )
+            engine._scan_items(iter([raw]), "test", "all", 1, False)
 
-        engine.client.parse_media_item.assert_called()
+        engine.client.normalize_item.assert_called_once_with(raw)
+
+    def test_instagram_normalization_uses_the_public_parser(self):
+        client = InstagramClient(allow_network_fallbacks=False)
+        raw = {"code": "X", "media_type": 2}
+
+        with patch.object(client, "parse_media_item", return_value={"id": "X"}) as parse:
+            client.normalize_item(raw)
+
+        parse.assert_called_once_with(raw)
 
 
 class ShortcodeValidationTests(unittest.TestCase):

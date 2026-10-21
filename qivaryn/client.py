@@ -9,8 +9,20 @@ from http.cookiejar import LoadError, MozillaCookieJar
 from typing import Any, Dict, Optional, Generator, Tuple
 from urllib.parse import urljoin, urlsplit
 
-class InstagramClient:
+from .platforms.base import AccountFeed, BasePlatformClient
+
+class InstagramClient(BasePlatformClient):
     """Handles mobile API communication, robust 1080p DASH/progressive stream extraction, and profile lookups."""
+
+    name = "instagram"
+    display_name = "Instagram"
+    supported_media_types = ("all", "posts", "reels", "videos", "carousels")
+    filter_aliases = {
+        "posts": ("post", "carousel"),
+        "reels": ("reel",),
+        "videos": ("reel",),
+        "carousels": ("carousel",),
+    }
 
     MOBILE_USER_AGENT = "Instagram 315.0.0.31.109 Android (33/13; 420dpi; 1080x2400; Google/google; Pixel 7; panther; en_US; 539395211)"
     DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -48,7 +60,11 @@ class InstagramClient:
         can disable them explicitly instead of the client guessing whether it
         is running under a mock.
         """
-        self.session = requests.Session()
+        super().__init__(
+            sessionid=sessionid,
+            cookies_file=cookies_file,
+            allow_network_fallbacks=allow_network_fallbacks,
+        )
         self.session.headers.update({
             "User-Agent": self.MOBILE_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
@@ -59,13 +75,7 @@ class InstagramClient:
             "X-FB-HTTP-Engine": "Liger",
         })
 
-        self.cookies_file = cookies_file
-        self.sessionid = sessionid
-        self.allow_network_fallbacks = allow_network_fallbacks
         self.restricted_profiles: Dict[str, str] = {}
-
-        if cookies_file:
-            self.load_cookies_from_file(cookies_file)
 
         if sessionid:
             self.session.cookies.set("sessionid", sessionid, domain=".instagram.com")
@@ -1265,10 +1275,14 @@ class InstagramClient:
                     "is_video": c_vid is not None
                 })
 
+        owner = item.get("owner") or item.get("user") or {}
+        account = str(owner.get("username") or "") if isinstance(owner, dict) else ""
+
         return {
             "shortcode": shortcode,
             "media_type": media_type,
             "timestamp": timestamp,
+            "account": account,
             "video_url": video_url,
             "audio_url": audio_url,
             "audio_start_ms": audio_start_ms,
@@ -1295,3 +1309,84 @@ class InstagramClient:
         if re.fullmatch(r"[A-Za-z0-9_-]+", last_part):
             return last_part
         return value
+
+    # ------------------------------------------------------------------
+    # Platform protocol
+    # ------------------------------------------------------------------
+    def extract_id(self, url_or_id: str) -> str:
+        return self.extract_shortcode_from_url(url_or_id)
+
+    def item_id(self, raw: dict) -> Optional[str]:
+        return raw.get("code") or (str(raw["pk"]) if raw.get("pk") else None)
+
+    def prefilter(self, raw: dict, media_filter: str) -> bool:
+        """Rejects raw feed items before the expensive DASH/XML parsing pass."""
+        mode = (media_filter or "all").lower()
+        if mode == "all":
+            return True
+        media_type = raw.get("media_type")
+        if mode in ("reels", "videos"):
+            return media_type == 2 or "video_versions" in raw
+        if mode == "carousels":
+            return media_type == 8 or "carousel_media" in raw
+        if mode == "posts":
+            return media_type != 2
+        return True
+
+    def normalize_item(self, raw: dict) -> dict:
+        return self.parse_media_item(raw)
+
+    def fetch_item(self, identifier: str) -> dict:
+        return self.fetch_post_by_shortcode(self.extract_shortcode_from_url(identifier))
+
+    def resolve_account_id(self, account: str) -> str:
+        return self.get_user_id(account)
+
+    def account_label(self, account: str) -> str:
+        return f"@{account}"
+
+    def account_feeds(self) -> Tuple[AccountFeed, ...]:
+        return (
+            AccountFeed(
+                "account feed",
+                "posts",
+                lambda account_id, max_pages, account_name="": self.fetch_user_raw_posts_paginated(
+                    account_id, max_pages=max_pages, username=account_name or None
+                ),
+            ),
+            AccountFeed(
+                "Reels tab",
+                "reels",
+                lambda account_id, max_pages, account_name="": self.fetch_user_raw_reels_paginated(
+                    account_id, max_pages=max_pages, username=account_name or None
+                ),
+            ),
+        )
+
+    def explain_empty_result(self, account: str) -> Optional[str]:
+        restriction = self.restricted_profiles.get(account.lower())
+        if not restriction:
+            restriction = self.check_profile_restriction(account)
+        if not restriction:
+            return None
+
+        lines = [
+            f"[-] Failed to download content for @{account}: "
+            f"Profile is age-restricted / gated ({restriction}).",
+            "    Instagram blocks unauthenticated and anonymous requests to this profile.",
+        ]
+        if self.has_session():
+            lines.append(
+                "    Your session was either rejected as expired/logged out or belongs "
+                "to an account under the required age."
+            )
+            lines.append(
+                "    Please log into Instagram with an adult (19+) account in your "
+                "browser and export fresh cookies."
+            )
+        else:
+            lines.append(
+                "    An active adult session (19+) is required. Retry with "
+                "--cookies cookies.txt or --sessionid SESSION_ID."
+            )
+        return "\n".join(lines)
