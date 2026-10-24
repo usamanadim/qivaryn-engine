@@ -14,6 +14,9 @@ from qivaryn.downloader import DEFAULT_OUTPUT_DIR, QivarynEngine
 
 
 class PlatformSelectionTests(unittest.TestCase):
+    def test_scan_command_is_registered(self):
+        self.assertIn("scan", cli.commands)
+
     def test_instagram_is_the_default_engine(self):
         self.assertIs(PLATFORM_ENGINES["instagram"], QivarynEngine)
 
@@ -109,6 +112,7 @@ class PlatformSelectionTests(unittest.TestCase):
             db_path="qivaryn_state.db",
             sessionid=None,
             cookies_file="cookies.txt",
+            consecutive_threshold=0,
             quality="best",
             quality_provided=False,
         )

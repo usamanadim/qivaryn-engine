@@ -51,7 +51,7 @@ class QivarynEngine:
         db_path: str = "qivaryn_state.db",
         sessionid: Optional[str] = None,
         cookies_file: Optional[str] = None,
-        consecutive_threshold: int = 3,
+        consecutive_threshold: int = 0,
         allow_network_fallbacks: bool = True,
         quality: str = "best",
         quality_confirmer: Optional[Callable[[dict], bool]] = None,
@@ -379,6 +379,81 @@ class QivarynEngine:
         )
 
     # ------------------------------------------------------------------
+    # URL / Account scanning (count without downloading)
+    # ------------------------------------------------------------------
+    def scan_url(self, url: str) -> dict:
+        """Scans a URL and returns content counts without downloading."""
+        target = self.client.detect_url(url)
+        if target is None:
+            raise ValueError(f"Unsupported {self.platform} URL: {url}")
+        target_type, identifier = target
+
+        if target_type == "single":
+            return {"type": "single", "identifier": identifier, "total": 1}
+
+        feed_filter = "reels" if target_type == "reels" else "all"
+        return self.scan_account(identifier, media_type_filter=feed_filter)
+
+    def scan_account(
+        self,
+        account: str,
+        media_type_filter: str = "all",
+    ) -> dict:
+        """Counts total items on an account feed without downloading."""
+        feeds = self.client.feeds_for(media_type_filter)
+        if not feeds:
+            raise ValueError(
+                f"{self.platform} does not support account scanning. "
+                "Pass a single item URL instead."
+            )
+
+        try:
+            account_id = self._resolve_account(account)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"Could not resolve {self.client.account_label(account)}: {exc}"
+            ) from exc
+
+        label = self.client.account_label(account)
+        filter_mode = (media_type_filter or "all").lower()
+        total = 0
+        already_downloaded = 0
+        known = self.db.get_all_downloaded_shortcodes(self.platform)
+
+        for feed in feeds:
+            if filter_mode != "all" and feed.media_filter.lower() != filter_mode:
+                continue
+            feed_name = feed.name
+            print(f"[*] Scanning {label} [{feed_name}; filter: {filter_mode}]...")
+            try:
+                items = feed.fetch(account_id, None, account)
+            except RuntimeError as exc:
+                print(f"[-] Failed to scan {feed_name} for {label}: {exc}")
+                continue
+
+            for raw in items:
+                item_id = self.client.item_id(raw)
+                if not item_id:
+                    continue
+                if not self.client.prefilter(raw, filter_mode):
+                    continue
+                total += 1
+                if str(item_id) in known or self._is_item_already_saved(str(item_id)):
+                    already_downloaded += 1
+                if total % 50 == 0:
+                    print(f"    ... scanned {total} items so far")
+            break  # Use only the first matching feed to avoid double-counting
+
+        return {
+            "type": filter_mode,
+            "account": account,
+            "label": label,
+            "total": total,
+            "already_downloaded": already_downloaded,
+            "remaining": total - already_downloaded,
+        }
+
+    # ------------------------------------------------------------------
     # Feed plumbing
     # ------------------------------------------------------------------
     def _download_feeds(
@@ -518,13 +593,14 @@ class QivarynEngine:
 
             if not force and (item_id in known or self._is_item_already_saved(item_id)):
                 skipped += 1
-                if count is None:
+                if count is None and self.consecutive_threshold > 0:
                     consecutive_known += 1
                     if consecutive_known >= self.consecutive_threshold:
                         print(
                             f"\n[>>] Early-Exit threshold reached "
                             f"({self.consecutive_threshold} consecutive known items). "
-                            "Resumption complete instantly!"
+                            "Resumption complete!\n"
+                            "     (To scan past known items and check for older content, use --no-early-exit)"
                         )
                         break
                 continue

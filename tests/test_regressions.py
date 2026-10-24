@@ -216,6 +216,13 @@ class EngineStateTests(unittest.TestCase):
         )
         self.assertEqual(engine.consecutive_threshold, 5)
 
+    def test_default_threshold_is_zero(self):
+        engine = QivarynEngine(
+            output_dir=self.temp_dir.name,
+            db_path=os.path.join(self.temp_dir.name, "state_def.db"),
+        )
+        self.assertEqual(engine.consecutive_threshold, 0)
+
     def test_invalid_consecutive_threshold_is_rejected(self):
         with self.assertRaises(ValueError):
             QivarynEngine(
