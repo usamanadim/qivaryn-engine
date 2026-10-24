@@ -193,6 +193,10 @@ _LIMIT_OPTION = click.option("--limit", "-l", "limit", type=int, default=None, h
 _MAX_PAGES_OPTION = click.option(
     "--max-pages", type=int, default=None, help="Maximum pagination pages to scan."
 )
+_THRESHOLD_OPTION = click.option(
+    "--threshold", default=0, type=int,
+    help="Stop after N consecutive already-downloaded items (0 = disabled, scan the full feed).",
+)
 
 
 @click.group(cls=URLFallbackGroup)
@@ -234,10 +238,7 @@ def single(url_or_id, platform, cookies_file, sessionid, output, db, force, qual
 @_LIMIT_OPTION
 @_OUTPUT_OPTION
 @_DB_OPTION
-@click.option(
-    "--threshold", default=3,
-    help="Consecutive known items before early-exit halt (only active when --count is omitted).",
-)
+@_THRESHOLD_OPTION
 @_MAX_PAGES_OPTION
 @_FORCE_OPTION
 @_QUALITY_OPTION
@@ -279,11 +280,12 @@ def download(account, platform, cookies_file, sessionid, media_type, count, limi
 @_LIMIT_OPTION
 @_OUTPUT_OPTION
 @_DB_OPTION
+@_THRESHOLD_OPTION
 @_MAX_PAGES_OPTION
 @_FORCE_OPTION
 @_QUALITY_OPTION
 def download_url(url, media_type, cookies_file, sessionid, count, limit, output, db,
-                 max_pages, force, quality):
+                 threshold, max_pages, force, quality):
     """Automatically download content based on a supported URL."""
     target_count = count if count is not None else limit
     if target_count is not None and target_count <= 0:
@@ -299,6 +301,7 @@ def download_url(url, media_type, cookies_file, sessionid, count, limit, output,
         db_path=db,
         sessionid=sessionid,
         cookies_file=cookies_file,
+        consecutive_threshold=threshold,
         quality=quality,
         quality_provided=_quality_was_provided(),
     )
@@ -309,6 +312,56 @@ def download_url(url, media_type, cookies_file, sessionid, count, limit, output,
         count=target_count,
         media_type=media_type,
     )
+
+
+@cli.command()
+@click.argument("url")
+@_COOKIES_OPTION
+@_SESSIONID_OPTION
+@_DB_OPTION
+def scan(url, cookies_file, sessionid, db):
+    """Scan a URL to count available items without downloading.
+
+    Accepts an Instagram profile URL (posts or reels tab) and reports
+    how many items are available, how many are already downloaded, and
+    how many remain.
+
+    Examples:
+
+      qivaryn scan https://www.instagram.com/username/reels/
+
+      qivaryn scan https://www.instagram.com/username/ --cookies cookies.txt
+    """
+    platform = _platform_for_url(url)
+    engine = _create_engine(
+        platform=platform,
+        db_path=db,
+        sessionid=sessionid,
+        cookies_file=cookies_file,
+    )
+    try:
+        result = engine.scan_url(url)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if result.get("type") == "single":
+        print(f"\n[+] Single item detected: {result['identifier']}")
+        return
+
+    label = result.get("label", result.get("account", ""))
+    total = result["total"]
+    downloaded = result["already_downloaded"]
+    remaining = result["remaining"]
+    feed_type = result.get("type", "all")
+
+    feed_desc = "reels" if feed_type == "reels" else "posts"
+    print(f"\n{'=' * 50}")
+    print(f"  Account:             {label}")
+    print(f"  Feed scanned:        {feed_desc}")
+    print(f"  Total items found:   {total}")
+    print(f"  Already downloaded:  {downloaded}")
+    print(f"  Remaining:           {remaining}")
+    print(f"{'=' * 50}")
 
 
 @cli.command("clear-db")

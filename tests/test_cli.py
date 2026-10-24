@@ -109,6 +109,7 @@ class PlatformSelectionTests(unittest.TestCase):
             db_path="qivaryn_state.db",
             sessionid=None,
             cookies_file="cookies.txt",
+            consecutive_threshold=0,
             quality="best",
             quality_provided=False,
         )

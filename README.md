@@ -14,6 +14,7 @@ Qivaryn is a high-performance, multi-platform media downloader with a shared com
 - **Audio & Video Merging**: When a platform provides split video/audio streams (Instagram DASH, YouTube adaptive formats), Qivaryn uses FFmpeg to merge them.
 - **Batch Limits (`--count`)**: Specify the exact number of **new** items to save. Previously downloaded content is skipped without counting toward the quota.
 - **Download Resumption**: Tracks downloaded items per platform in a local SQLite database (`qivaryn_state.db`).
+- **Feed Scanning**: Count available and already-downloaded items without downloading them.
 - **Dual Interface**: Offers both a command-line interface (CLI) and a Python library API.
 
 ### Supported platforms
@@ -151,7 +152,20 @@ qivaryn "<SUPPORTED_URL>" [OPTIONS]
 | `--output DIR` | `-o DIR` | Root directory that holds the platform folders. | `./Downloads/Qivaryn` |
 | `--db PATH` | | Path to SQLite state database for download tracking. | `qivaryn_state.db` |
 | `--max-pages N` | | Maximum feed pagination pages to scan. | Unlimited |
+| `--threshold N` | | Stop after N consecutive already-downloaded items; `0` scans the full feed. | `0` |
 | `--force` | `-f` | Re-download and overwrite even if already saved. | `False` |
+
+### Scan without downloading
+
+Use `qivaryn scan` to count items in a supported account feed and see how many
+are already downloaded and how many remain:
+
+```console
+qivaryn scan "https://www.instagram.com/USERNAME/"
+qivaryn scan "https://www.instagram.com/USERNAME/reels/" --cookies cookies.txt
+```
+
+Single-item URLs are identified without fetching or downloading the item.
 
 ### 2. Explicit Subcommands
 
@@ -292,7 +306,7 @@ engine = QivarynEngine(
     output_dir="./Downloads/Qivaryn",  # Platform folders are created inside it
     db_path="./qivaryn_state.db",
     cookies_file="./cookies.txt",   # Optional: omit for public content
-    consecutive_threshold=3,        # Stop after N consecutive known items
+    consecutive_threshold=0,        # 0 scans the full feed; N enables early exit
     allow_network_fallbacks=True,   # Retry without the session when it expires
 )
 
@@ -315,6 +329,9 @@ engine.download_single("https://youtu.be/VIDEO_ID", force=False)
 
 # 4. Playlists (YouTube)
 engine.download_playlist("PLxxxxxxxxxxxxxxxx")
+
+# 5. Count account feed items without downloading
+summary = engine.scan_account("@CHANNEL", media_type_filter="all")
 ```
 
 `InstagramEngine` remains available as an alias of `QivarynEngine`, and the platform clients are importable directly:

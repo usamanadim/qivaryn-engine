@@ -3,6 +3,7 @@ import json
 import re
 import os
 import base64
+import time
 import html
 import xml.etree.ElementTree as ET
 from http.cookiejar import LoadError, MozillaCookieJar
@@ -603,6 +604,7 @@ class InstagramClient(BasePlatformClient):
         """Yields raw feed items instantly for lightning-fast resumption checks."""
         max_id = None
         pages_fetched = 0
+        consecutive_empty_pages = 0
         while True:
             if max_pages is not None:
                 if max_pages <= 0:
@@ -639,13 +641,22 @@ class InstagramClient(BasePlatformClient):
                 break
             result = response.json()
             items = result.get("items", [])
-            if not items:
-                break
             for item in items:
                 yield item
-            if not result.get("more_available", False):
+
+            more_available = result.get("more_available", False)
+            next_max_id = result.get("next_max_id")
+
+            if not items:
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= 5:
+                    break
+            else:
+                consecutive_empty_pages = 0
+
+            if not more_available or not next_max_id or next_max_id == max_id:
                 break
-            max_id = result.get("next_max_id")
+            max_id = next_max_id
             pages_fetched += 1
 
     def fetch_user_raw_reels_paginated(
@@ -661,6 +672,7 @@ class InstagramClient(BasePlatformClient):
         api_error_title = ""
         api_logout_reason = None
         api_status_code = 200
+        consecutive_empty_pages = 0
 
         while max_pages is None or pages_fetched < max_pages:
             data = {"target_user_id": user_id, "page_size": 12}
@@ -701,6 +713,25 @@ class InstagramClient(BasePlatformClient):
                     except Exception:
                         pass
 
+            if response.status_code == 429:
+                retried = False
+                for attempt in range(1, 3):
+                    time.sleep(2 * attempt)
+                    try:
+                        retry_resp = self.session.post(
+                            "https://i.instagram.com/api/v1/clips/user/",
+                            data=data,
+                            timeout=15,
+                        )
+                        if retry_resp.status_code == 200:
+                            response = retry_resp
+                            retried = True
+                            break
+                    except Exception:
+                        pass
+                if not retried:
+                    break
+
             if response.status_code != 200:
                 break
 
@@ -709,16 +740,24 @@ class InstagramClient(BasePlatformClient):
             except Exception:
                 break
             items = result.get("items", [])
-            if not items:
-                break
             for item in items:
                 media = item.get("media") or item.get("clip")
                 total_items_yielded += 1
                 yield media if isinstance(media, dict) else item
 
             paging_info = result.get("paging_info") or {}
-            more_available = result.get("more_available") or paging_info.get("more_available")
+            more_available = result.get("more_available")
+            if more_available is None:
+                more_available = paging_info.get("more_available")
             next_max_id = result.get("next_max_id") or paging_info.get("max_id") or paging_info.get("end_cursor")
+
+            if not items:
+                consecutive_empty_pages += 1
+                if consecutive_empty_pages >= 5:
+                    break
+            else:
+                consecutive_empty_pages = 0
+
             if not more_available or not next_max_id or next_max_id == max_id:
                 break
             max_id = next_max_id
