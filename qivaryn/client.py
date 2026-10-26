@@ -3,6 +3,7 @@ import json
 import re
 import os
 import base64
+import copy
 import time
 import html
 import xml.etree.ElementTree as ET
@@ -11,6 +12,17 @@ from typing import Any, Dict, Optional, Generator, Tuple
 from urllib.parse import urljoin, urlsplit
 
 from .platforms.base import AccountFeed, BasePlatformClient
+
+
+def _clean_embedded_url(value: str) -> str:
+    """Turns a JSON-escaped URL from an embed page into a usable URL."""
+    return (
+        str(value)
+        .replace("\\/", "/")
+        .replace("\\u0026", "&")
+        .replace("\\u003d", "=")
+    )
+
 
 class InstagramClient(BasePlatformClient):
     """Handles mobile API communication, robust 1080p DASH/progressive stream extraction, and profile lookups."""
@@ -27,6 +39,13 @@ class InstagramClient(BasePlatformClient):
 
     MOBILE_USER_AGENT = "Instagram 315.0.0.31.109 Android (33/13; 420dpi; 1080x2400; Google/google; Pixel 7; panther; en_US; 539395211)"
     DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    #: App ID the Android app sends. Instagram rejects some requests without it.
+    MOBILE_APP_ID = "567067343352427"
+    #: App ID the website sends; used for the web JSON fallback.
+    WEB_APP_ID = "936619743392459"
+
+    #: Cookies that must also be available on ``i.instagram.com``.
+    _SHARED_COOKIES = ("sessionid", "csrftoken", "ds_user_id", "mid", "ig_did")
 
     @staticmethod
     def detect_url(url: str) -> Optional[Tuple[str, str]]:
@@ -69,6 +88,7 @@ class InstagramClient(BasePlatformClient):
         self.session.headers.update({
             "User-Agent": self.MOBILE_USER_AGENT,
             "Accept-Language": "en-US,en;q=0.9",
+            "X-IG-App-ID": self.MOBILE_APP_ID,
             "X-IG-Capabilities": "36r/F/8=",
             "X-IG-Connection-Type": "WIFI",
             "X-IG-Bandwidth-Speed-KBPS": "25000",
@@ -77,6 +97,8 @@ class InstagramClient(BasePlatformClient):
         })
 
         self.restricted_profiles: Dict[str, str] = {}
+        #: Cached answer from ``_session_is_valid`` (None until it is checked).
+        self._session_valid: Optional[bool] = None
 
         if sessionid:
             self.session.cookies.set("sessionid", sessionid, domain=".instagram.com")
@@ -95,6 +117,88 @@ class InstagramClient(BasePlatformClient):
                 return True
         return False
 
+    def _web_api_headers(self) -> dict:
+        """Headers that make Instagram treat the request as the website."""
+        return {
+            "User-Agent": self.DESKTOP_USER_AGENT,
+            "X-IG-App-ID": self.WEB_APP_ID,
+            "X-ASBD-ID": "198387",
+            "X-IG-WWW-Claim": "0",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+            # Mobile-app headers from the session must not leak into a web
+            # request; mixing the two identities is what makes Instagram
+            # reject a valid session.
+            "X-IG-Capabilities": None,
+            "X-IG-Connection-Type": None,
+            "X-IG-Bandwidth-Speed-KBPS": None,
+            "X-IG-Connection-Speed": None,
+            "X-FB-HTTP-Engine": None,
+        }
+
+    def _session_is_valid(self) -> Optional[bool]:
+        """Checks whether the configured session still works.
+
+        Returns True/False when Instagram answered, and None when the check
+        itself could not be completed.  The result is cached so at most one
+        extra request is made per download run.
+        """
+        if self._session_valid is not None:
+            return self._session_valid
+        if not self.has_session():
+            self._session_valid = False
+            return False
+
+        # Ask the identity that matches the session type first.  A browser
+        # session checked against the app endpoint can look logged out even
+        # when it is perfectly valid.
+        if self.cookies_file:
+            checks = [
+                (
+                    "https://www.instagram.com/api/v1/accounts/current_user/",
+                    self._web_api_headers(),
+                )
+            ]
+            if self.allow_network_fallbacks:
+                checks.append(
+                    ("https://i.instagram.com/api/v1/accounts/current_user/", None)
+                )
+        else:
+            checks = [("https://i.instagram.com/api/v1/accounts/current_user/", None)]
+            if self.allow_network_fallbacks:
+                checks.append(
+                    (
+                        "https://www.instagram.com/api/v1/accounts/current_user/",
+                        self._web_api_headers(),
+                    )
+                )
+
+        answered = False
+        for url, headers in checks:
+            try:
+                response = self.session.get(url, headers=headers, timeout=10)
+            except requests.RequestException:
+                continue
+            answered = True
+            if response.status_code == 200:
+                # Instagram answers 200 with ``{"status": "fail"}`` even when
+                # the request is not authenticated, so a bare 200 proves
+                # nothing.
+                try:
+                    payload = response.json()
+                except ValueError:
+                    continue
+                user = payload.get("user") if isinstance(payload, dict) else None
+                if isinstance(user, dict) and (user.get("pk") or user.get("username")):
+                    self._session_valid = True
+                    return True
+
+        if answered:
+            self._session_valid = False
+            return False
+        return None
+
     def load_cookies_from_file(self, cookies_file_path: str):
         if not os.path.exists(cookies_file_path):
             raise FileNotFoundError(
@@ -112,11 +216,39 @@ class InstagramClient(BasePlatformClient):
             ) from exc
         loaded_count = 0
         for cookie in cj:
-            if "instagram.com" in getattr(cookie, "domain", ""):
-                self.session.cookies.set_cookie(cookie)
-                loaded_count += 1
+            domain = getattr(cookie, "domain", "") or ""
+            if "instagram.com" not in domain:
+                continue
+            self.session.cookies.set_cookie(cookie)
+            loaded_count += 1
+
+            # Browser exports often list cookies for www.instagram.com only.
+            # requests does not send those to i.instagram.com (where the media
+            # API lives), which looks like an expired session. Mirror the
+            # important cookies onto the shared domain so every endpoint gets
+            # them.
+            if not domain.startswith(".") and cookie.name in self._SHARED_COOKIES:
+                shared = copy.copy(cookie)
+                shared.domain = ".instagram.com"
+                self.session.cookies.set_cookie(shared)
         if loaded_count == 0:
             self.session.cookies.update(cj)
+        names = {
+            cookie.name
+            for cookie in cj
+            if "instagram.com" in (getattr(cookie, "domain", "") or "")
+        }
+        if "sessionid" not in names:
+            print(
+                "[!] Warning: cookies.txt does not contain a 'sessionid' cookie, "
+                "so Instagram will treat the download as logged out. Export the "
+                "cookies again while logged in to instagram.com."
+            )
+        elif not {"csrftoken", "ds_user_id"}.issubset(names):
+            print(
+                "[!] Warning: cookies.txt is missing csrftoken and/or ds_user_id. "
+                "Instagram may reject the session; export all instagram.com cookies."
+            )
         print(f"[+] Successfully loaded cookies from: {cookies_file_path}")
 
     @staticmethod
@@ -282,41 +414,100 @@ class InstagramClient(BasePlatformClient):
                 f"'{shortcode}' is not a valid Instagram shortcode, so it cannot be "
                 "downloaded. Pass a post URL or a valid shortcode."
             ) from exc
-        url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
-        response = self.session.get(url, timeout=15)
+        # The mobile app endpoint lives on i.instagram.com, while a
+        # browser-exported session must talk to the website's own host.
+        # Sending a web session to the app host is a common cause of a false
+        # "You've Been Logged Out" 403.
+        app_url = f"https://i.instagram.com/api/v1/media/{media_id}/info/"
+        web_url = f"https://www.instagram.com/api/v1/media/{media_id}/info/"
         login_required = False
-        if response.status_code == 200:
-            try:
-                return self.parse_media_item(response.json()["items"][0])
-            except (KeyError, IndexError, ValueError):
-                pass  # Malformed response – fall through to HTML route
+        error_data: dict = {}
+
+        # Browser-exported cookies belong to the website, so ask as the website
+        # first. Sessions created by --sessionid are asked for as the app first.
+        # The other identity is tried when fallbacks are enabled.
+        if self.cookies_file:
+            attempts = [("website", web_url, self._web_api_headers())]
+            if self.allow_network_fallbacks:
+                attempts.append(("app", app_url, None))
         else:
+            attempts = [("app", app_url, None)]
+            if self.allow_network_fallbacks:
+                attempts.append(("website", web_url, self._web_api_headers()))
+
+        response = None
+        attempt_summary = []
+        for label, attempt_url, attempt_headers in attempts:
             try:
-                error_data = response.json()
-            except ValueError:
-                error_data = {}
-            if isinstance(error_data, dict):
-                login_required = (
-                    error_data.get("message") == "login_required"
-                    or error_data.get("error_type") == "login_required"
-                    or "logged out" in str(error_data.get("error_title", "")).lower()
+                response = self.session.get(
+                    attempt_url, headers=attempt_headers, timeout=15
                 )
+            except requests.RequestException:
+                attempt_summary.append(f"{label} API: network error")
+                response = None
+                continue
+            if response.status_code == 200:
+                try:
+                    return self.parse_media_item(response.json()["items"][0])
+                except (KeyError, IndexError, TypeError, ValueError):
+                    pass  # Malformed response – try the next identity
+            attempt_summary.append(f"{label} API: HTTP {response.status_code}")
+            try:
+                candidate = response.json()
+            except ValueError:
+                candidate = {}
+            if isinstance(candidate, dict) and candidate:
+                error_data = candidate
+                if (
+                    candidate.get("message") == "login_required"
+                    or candidate.get("error_type") == "login_required"
+                    or "logged out" in str(candidate.get("error_title", "")).lower()
+                ):
+                    login_required = True
+
+        status_code = response.status_code if response is not None else 0
+
+        if self.allow_network_fallbacks and status_code != 200:
+            # The public embed page is the most reliable last resort.
+            recovered = self._fetch_post_from_embed(shortcode)
+            if recovered is not None:
+                return recovered
+            recovered = self._fetch_post_from_web_json(shortcode)
+            if recovered is not None:
+                return recovered
+            recovered = self._fetch_post_from_graphql(shortcode)
+            if recovered is not None:
+                return recovered
 
         # Fallback: scrape the reel/post HTML page for embedded media JSON
-        print(f"[!] Mobile API returned {response.status_code} for {shortcode}. Trying HTML fallback...")
+        detail = "; ".join(attempt_summary) or "no API response"
+        print(
+            f"[!] Instagram refused {shortcode} ({detail}). "
+            "Trying the public page as a last resort..."
+        )
         try:
             return self._fetch_post_from_html(shortcode)
         except RuntimeError as exc:
             err_msg = str(exc)
-            error_title = error_data.get("error_title") if isinstance(error_data, dict) else ""
+            error_title = error_data.get("error_title", "") if isinstance(error_data, dict) else ""
             is_logged_out = (
                 "logged out" in str(error_title).lower()
                 or (isinstance(error_data, dict) and error_data.get("logout_reason") is not None)
+            )
+            session_really_valid = (
+                self.has_session() and self._session_is_valid() is True
             )
 
             # Case 1: Post is age-gated / mature audience
             if "age-restricted" in err_msg.lower() or "mature audience" in err_msg.lower():
                 if is_logged_out and (self.cookies_file or self.sessionid):
+                    if session_really_valid:
+                        raise RuntimeError(
+                            f"Item {shortcode} is age-restricted (requires a verified 19+ account). "
+                            "Your cookies.txt session is valid, but this account is not age-verified "
+                            "for this reel. Log into Instagram with a verified 19+ account and export "
+                            "fresh cookies."
+                        ) from exc
                     raise RuntimeError(
                         f"Item {shortcode} is age-restricted (requires a verified 19+ account). "
                         "The session provided via cookies/sessionid was rejected as EXPIRED or LOGGED OUT "
@@ -333,6 +524,13 @@ class InstagramClient(BasePlatformClient):
 
             # Case 2: Session was explicitly rejected as logged out / expired
             if is_logged_out and (self.cookies_file or self.sessionid):
+                if session_really_valid:
+                    raise RuntimeError(
+                        f"Instagram refused access to {shortcode}, but your cookies.txt session "
+                        "is still valid. This specific reel is most likely age-restricted, removed, "
+                        "or not visible to this account. It will be skipped and retried on the "
+                        "next run."
+                    ) from exc
                 raise RuntimeError(
                     f"Your Instagram session is expired or logged out "
                     f"(Instagram reported: \"{error_title or 'You have been logged out'}\"). "
@@ -349,6 +547,180 @@ class InstagramClient(BasePlatformClient):
                     "The post may also be private, removed, or unavailable."
                 ) from exc
             raise
+
+    def _fetch_post_from_embed(self, shortcode: str) -> Optional[dict]:
+        """Recovers a reel from Instagram's public embed page.
+
+        The embed page is served without login and embeds the direct video URL
+        in its HTML, which makes it the most reliable last resort for a public
+        reel that the regular API refuses.
+        """
+        headers = {
+            "User-Agent": self.DESKTOP_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://www.instagram.com/reel/{shortcode}/",
+        }
+        for prefix in ("reel", "p"):
+            try:
+                response = self.session.get(
+                    f"https://www.instagram.com/{prefix}/{shortcode}/embed/captioned/",
+                    headers=headers,
+                    timeout=15,
+                )
+            except requests.RequestException:
+                continue
+            if response.status_code != 200 or not response.text:
+                continue
+            video_match = re.search(r'"video_url"\s*:\s*"([^"]+)"', response.text)
+            if not video_match:
+                continue
+            image_match = re.search(r'"display_url"\s*:\s*"([^"]+)"', response.text)
+            print(f"[!] Recovered {shortcode} from Instagram's embed page (best-effort quality).")
+            return {
+                "shortcode": shortcode,
+                "media_type": "Reel",
+                "timestamp": "",
+                "video_url": _clean_embedded_url(video_match.group(1)),
+                "audio_url": None,
+                "quality": "embed (best-effort)",
+                "display_url": (
+                    _clean_embedded_url(image_match.group(1)) if image_match else None
+                ),
+                "children": [],
+            }
+        return None
+
+    def _fetch_post_from_web_json(self, shortcode: str) -> Optional[dict]:
+        """Reads media JSON from the website's own front-end endpoint.
+
+        This route uses the web app ID with the current cookies, so it often
+        succeeds on reels where the mobile endpoint says the session is logged
+        out.  Returns a normalized media dict, or None when nothing usable was
+        returned.
+        """
+        headers = self._web_api_headers()
+        for prefix in ("reel", "p"):
+            try:
+                response = self.session.get(
+                    f"https://www.instagram.com/{prefix}/{shortcode}/",
+                    params={"__a": "1", "__d": "dis"},
+                    headers=headers,
+                    timeout=15,
+                )
+            except requests.RequestException:
+                continue
+            if response.status_code != 200:
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+            item = self._dig_for_media_item(payload, shortcode)
+            if item:
+                return self.parse_media_item(item)
+            if isinstance(payload, dict):
+                items = payload.get("items")
+                if isinstance(items, list) and items:
+                    first = items[0]
+                    if isinstance(first, dict) and (
+                        "video_versions" in first or "image_versions2" in first
+                    ):
+                        return self.parse_media_item(first)
+        return None
+
+    def _fetch_post_from_graphql(self, shortcode: str) -> Optional[dict]:
+        """Reads media from the website's public GraphQL query.
+
+        The regular web JSON route sometimes answers with a login wall while
+        the GraphQL endpoint still returns the post.  Only public data is used,
+        and every failure simply moves on to the next route.
+        """
+        headers = self._web_api_headers()
+        variables = json.dumps({"shortcode": shortcode}, separators=(",", ":"))
+        for doc_id in ("8845758582119845", "10015901848480474"):
+            try:
+                response = self.session.get(
+                    "https://www.instagram.com/graphql/query/",
+                    params={"doc_id": doc_id, "variables": variables},
+                    headers=headers,
+                    timeout=15,
+                )
+            except requests.RequestException:
+                continue
+            if response.status_code != 200:
+                continue
+            try:
+                payload = response.json()
+            except ValueError:
+                continue
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                continue
+            media = data.get("xdt_shortcode_media") or data.get("shortcode_media")
+            if not isinstance(media, dict):
+                continue
+            normalized = self._normalize_web_media(media, shortcode)
+            if normalized is not None:
+                return self.parse_media_item(normalized)
+        return None
+
+    @staticmethod
+    def _normalize_web_media(media: dict, shortcode: str) -> Optional[dict]:
+        """Converts a website GraphQL media object into the mobile API shape."""
+        if not isinstance(media, dict):
+            return None
+        video_url = media.get("video_url")
+        display_url = media.get("display_url")
+        if not video_url and not display_url:
+            return None
+
+        dimensions = media.get("dimensions") or {}
+        width = dimensions.get("width") or 0
+        height = dimensions.get("height") or 0
+        owner = media.get("owner") or {}
+
+        def _convert(node: dict) -> dict:
+            node_dimensions = node.get("dimensions") or {}
+            node_width = node_dimensions.get("width") or width
+            node_height = node_dimensions.get("height") or height
+            converted = {
+                "code": node.get("shortcode") or shortcode,
+                "taken_at": node.get("taken_at_timestamp") or media.get("taken_at_timestamp") or "",
+                "owner": owner,
+            }
+            if node.get("video_url"):
+                converted["media_type"] = 2
+                converted["video_versions"] = [
+                    {"url": node["video_url"], "width": node_width, "height": node_height}
+                ]
+            else:
+                converted["media_type"] = 1
+            if node.get("display_url"):
+                converted["image_versions2"] = {
+                    "candidates": [
+                        {
+                            "url": node["display_url"],
+                            "width": node_width,
+                            "height": node_height,
+                        }
+                    ]
+                }
+            return converted
+
+        item = _convert(media)
+        sidecar = media.get("edge_sidecar_to_children") or {}
+        edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
+        if isinstance(edges, list) and edges:
+            children = []
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                if isinstance(node, dict):
+                    children.append(_convert(node))
+            if children:
+                item["media_type"] = 8
+                item["carousel_media"] = children
+        return item
 
     def _fetch_post_from_html(self, shortcode: str) -> dict:
         """
@@ -605,6 +977,7 @@ class InstagramClient(BasePlatformClient):
         max_id = None
         pages_fetched = 0
         consecutive_empty_pages = 0
+        truncation: Optional[str] = None
         while True:
             if max_pages is not None:
                 if max_pages <= 0:
@@ -613,8 +986,10 @@ class InstagramClient(BasePlatformClient):
                     break
             url = f"https://i.instagram.com/api/v1/feed/user/{user_id}/"
             params = {"max_id": max_id} if max_id else {}
-            response = self.session.get(url, params=params, timeout=15)
-            if response.status_code != 200:
+            response = self._request_with_retries(
+                lambda: self.session.get(url, params=params, timeout=15)
+            )
+            if response is None or response.status_code != 200:
                 if pages_fetched == 0 and username and self.allow_network_fallbacks:
                     timeline_items = list(self._fetch_profile_timeline_from_html(username))
                     if timeline_items:
@@ -624,6 +999,7 @@ class InstagramClient(BasePlatformClient):
 
                 if pages_fetched == 0:
                     err_hint = ""
+                    status = "no response" if response is None else response.status_code
                     try:
                         err_json = response.json()
                         msg = err_json.get("message") or err_json.get("error_title")
@@ -633,14 +1009,32 @@ class InstagramClient(BasePlatformClient):
                         pass
                     raise RuntimeError(
                         f"Failed to fetch posts feed for user {user_id}: "
-                        f"Instagram returned HTTP {response.status_code}{err_hint}. "
+                        f"Instagram returned HTTP {status}{err_hint}. "
                         "Accessing an account's posts grid requires an active, authenticated Instagram session. "
                         "The session in cookies.txt appears to be expired or logged out. "
                         "Please export a fresh cookies.txt file from your browser while logged in."
                     )
+                truncation = (
+                    f"Posts feed for user {user_id} stopped at page "
+                    f"{pages_fetched + 1}: "
+                    + (
+                        "the request failed after retries."
+                        if response is None
+                        else f"HTTP {response.status_code}."
+                    )
+                )
                 break
-            result = response.json()
-            items = result.get("items", [])
+            try:
+                result = response.json()
+            except Exception:
+                truncation = (
+                    f"Posts feed for user {user_id} stopped at page "
+                    f"{pages_fetched + 1}: Instagram returned invalid JSON."
+                )
+                break
+            if not isinstance(result, dict):
+                result = {}
+            items = result.get("items") or []
             for item in items:
                 yield item
 
@@ -654,10 +1048,121 @@ class InstagramClient(BasePlatformClient):
             else:
                 consecutive_empty_pages = 0
 
-            if not more_available or not next_max_id or next_max_id == max_id:
+            if not more_available or not next_max_id:
+                break
+            if next_max_id == max_id:
+                print(
+                    "[!] Instagram returned the same posts cursor twice; "
+                    "stopping pagination to avoid an infinite loop."
+                )
                 break
             max_id = next_max_id
             pages_fetched += 1
+
+        if truncation:
+            raise RuntimeError(truncation)
+
+    #: HTTP statuses worth retrying: rate limits and transient server errors.
+    _RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+    def _request_with_retries(self, send, attempts: int = 3):
+        """Retries a request callable on rate limits and transient failures.
+
+        ``send`` is a zero-argument callable so callers keep using
+        ``session.get``/``session.post`` (and their patched test doubles).
+        Returns the last response, or None when every attempt raised.
+        """
+        response = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = send()
+            except Exception:
+                response = None
+            else:
+                if response.status_code not in self._RETRY_STATUSES:
+                    return response
+            if attempt < attempts:
+                time.sleep(self._retry_delay(response, attempt))
+        return response
+
+    @staticmethod
+    def _retry_delay(response, attempt: int) -> float:
+        """Returns the delay before the next attempt (honours Retry-After)."""
+        if response is not None:
+            try:
+                retry_after = float(response.headers.get("Retry-After"))
+            except (TypeError, ValueError, AttributeError):
+                retry_after = 0.0
+            if retry_after > 0:
+                return min(retry_after, 30.0)
+        return float(min(2 ** attempt, 8))
+
+    @staticmethod
+    def _raw_timestamp(item: dict) -> Optional[int]:
+        """Returns an item's upload time in epoch seconds, when available."""
+        for key in ("taken_at", "taken_at_timestamp", "device_timestamp"):
+            value = item.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _reels_entry(cls, item: dict) -> dict:
+        """Unwraps a ``clips/user`` entry, keeping identity on the media object."""
+        media = item.get("media") or item.get("clip")
+        if not isinstance(media, dict):
+            media = item
+        merged = dict(media)
+        for key in (
+            "code", "pk", "taken_at", "is_pinned", "pinned",
+            "is_pinned_to_profile", "is_pinned_to_grid",
+            "clips_tab_pinned_user_ids", "timeline_pinned_user_ids",
+            "media_type",
+        ):
+            if merged.get(key) in (None, "") and item.get(key) not in (None, ""):
+                merged[key] = item[key]
+        return merged
+
+    @staticmethod
+    def _is_pinned(item: dict) -> bool:
+        """Returns True when Instagram marks the item as pinned to the Reels tab or profile."""
+        if not isinstance(item, dict):
+            return False
+
+        candidate_dicts = [item]
+        media = item.get("media") or item.get("clip")
+        if isinstance(media, dict):
+            candidate_dicts.append(media)
+
+        for d in candidate_dicts:
+            for key in (
+                "is_pinned", "pinned", "is_pinned_to_profile",
+                "is_pinned_to_grid", "is_pinned_to_timeline", "is_pinned_to_clips",
+            ):
+                val = d.get(key)
+                if val is True or val == 1 or val == "1":
+                    return True
+
+            for key in ("clips_tab_pinned_user_ids", "timeline_pinned_user_ids"):
+                ids = d.get(key)
+                if isinstance(ids, (list, tuple, set)) and len(ids) > 0:
+                    return True
+
+        return False
+
+    @classmethod
+    def _reels_sort_key(cls, item: dict):
+        """Pinned reels first, then newest-to-oldest; undated items last."""
+        if cls._is_pinned(item):
+            return (0, 0, 0)
+        timestamp = cls._raw_timestamp(item)
+        if timestamp is None:
+            return (1, 1, 0)
+        return (1, 0, -timestamp)
 
     def fetch_user_raw_reels_paginated(
         self,
@@ -665,91 +1170,154 @@ class InstagramClient(BasePlatformClient):
         max_pages: Optional[int] = None,
         username: Optional[str] = None,
     ) -> Generator[dict, None, None]:
-        """Yields raw media from the profile's dedicated Reels tab."""
+        """Yields the Reels tab in strict newest-to-oldest order.
+
+        Instagram pins reels at the top of the tab and returns pages in
+        chronological order (newest to oldest). Each page's items are deduplicated
+        and sorted so that pinned reels are yielded first, followed by reels in
+        descending chronological order.
+
+        Yielding items page-by-page allows consumers to stream downloads
+        immediately without buffering the account's entire history.
+
+        If a page fails after retries, the items fetched so far are still
+        yielded and a truncation error is raised afterwards, so the caller can
+        report that older reels were not reached instead of looking complete.
+        """
+        seen = set()
         max_id = None
         pages_fetched = 0
-        total_items_yielded = 0
+        yielded_any = False
         api_error_title = ""
         api_logout_reason = None
+        api_require_login = False
         api_status_code = 200
         consecutive_empty_pages = 0
+        truncation: Optional[str] = None
 
         while max_pages is None or pages_fetched < max_pages:
             data = {"target_user_id": user_id, "page_size": 12}
             if max_id:
                 data["max_id"] = max_id
-            response = self.session.post(
-                "https://i.instagram.com/api/v1/clips/user/",
-                data=data,
-                timeout=15,
+            # Browser-exported cookies are web sessions, so ask as the website
+            # first; app sessions (--sessionid) ask as the app first.
+            first_headers = self._web_api_headers() if self.cookies_file else None
+            response = self._request_with_retries(
+                lambda: self.session.post(
+                    "https://i.instagram.com/api/v1/clips/user/",
+                    data=data,
+                    headers=first_headers,
+                    timeout=15,
+                )
             )
+            pages_fetched += 1
+            if response is None:
+                api_status_code = 0
+                if pages_fetched > 1:
+                    truncation = (
+                        f"Reels feed for @{username or user_id} stopped at page "
+                        f"{pages_fetched}: the request failed after retries."
+                    )
+                break
+
             api_status_code = response.status_code
-            if response.status_code in (401, 403):
+            api_require_login = False
+            if response.status_code != 200:
                 try:
                     err_json = response.json()
                     api_error_title = err_json.get("error_title", "")
                     api_logout_reason = err_json.get("logout_reason")
+                    api_require_login = bool(err_json.get("require_login"))
                 except Exception:
                     pass
 
-                # Attempt an unauthenticated fallback for expired sessions.
+                # Retry with the other identity: the mobile app and the web use
+                # different app IDs. If that also fails, attempt an anonymous request.
                 if self.allow_network_fallbacks:
-                    clean_headers = {
-                        "User-Agent": self.MOBILE_USER_AGENT,
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "X-IG-Capabilities": "36r/F/8=",
-                        "X-IG-Connection-Type": "WIFI",
-                        "X-FB-HTTP-Engine": "Liger",
-                    }
-                    try:
-                        clean_resp = requests.post(
+                    retry_headers = None if first_headers else self._web_api_headers()
+                    retry_resp = self._request_with_retries(
+                        lambda: self.session.post(
                             "https://i.instagram.com/api/v1/clips/user/",
                             data=data,
-                            headers=clean_headers,
+                            headers=retry_headers,
                             timeout=15,
                         )
-                        if clean_resp.status_code == 200:
-                            response = clean_resp
-                    except Exception:
-                        pass
-
-            if response.status_code == 429:
-                retried = False
-                for attempt in range(1, 3):
-                    time.sleep(2 * attempt)
-                    try:
-                        retry_resp = self.session.post(
-                            "https://i.instagram.com/api/v1/clips/user/",
-                            data=data,
-                            timeout=15,
-                        )
-                        if retry_resp.status_code == 200:
-                            response = retry_resp
-                            retried = True
-                            break
-                    except Exception:
-                        pass
-                if not retried:
-                    break
+                    )
+                    if retry_resp is not None and retry_resp.status_code == 200:
+                        response = retry_resp
+                        api_status_code = 200
+                    else:
+                        # Last resort: anonymous retry for public profiles.
+                        clean_headers = {
+                            "User-Agent": self.MOBILE_USER_AGENT,
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "X-IG-App-ID": self.MOBILE_APP_ID,
+                            "X-IG-Capabilities": "36r/F/8=",
+                            "X-IG-Connection-Type": "WIFI",
+                            "X-FB-HTTP-Engine": "Liger",
+                        }
+                        try:
+                            clean_resp = requests.post(
+                                "https://i.instagram.com/api/v1/clips/user/",
+                                data=data,
+                                headers=clean_headers,
+                                timeout=15,
+                            )
+                            if clean_resp.status_code == 200:
+                                response = clean_resp
+                                api_status_code = 200
+                        except Exception:
+                            pass
 
             if response.status_code != 200:
+                if pages_fetched > 1:
+                    truncation = (
+                        f"Reels feed for @{username or user_id} stopped at page "
+                        f"{pages_fetched}: HTTP {response.status_code}. "
+                        "Reels after this page were not downloaded."
+                    )
                 break
 
             try:
                 result = response.json()
             except Exception:
+                if pages_fetched > 1:
+                    truncation = (
+                        f"Reels feed for @{username or user_id} stopped at page "
+                        f"{pages_fetched}: Instagram returned invalid JSON."
+                    )
                 break
-            items = result.get("items", [])
+            if not isinstance(result, dict):
+                result = {}
+
+            items = result.get("items") or []
+            page_entries = []
             for item in items:
-                media = item.get("media") or item.get("clip")
-                total_items_yielded += 1
-                yield media if isinstance(media, dict) else item
+                if not isinstance(item, dict):
+                    continue
+                entry = self._reels_entry(item)
+                identity = str(entry.get("code") or entry.get("pk") or "")
+                if identity:
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                page_entries.append(entry)
+
+            # Sort page entries so pinned reels are first, followed by newest to oldest
+            page_entries.sort(key=self._reels_sort_key)
+            for entry in page_entries:
+                yielded_any = True
+                yield entry
 
             paging_info = result.get("paging_info") or {}
             more_available = result.get("more_available")
             if more_available is None:
                 more_available = paging_info.get("more_available")
-            next_max_id = result.get("next_max_id") or paging_info.get("max_id") or paging_info.get("end_cursor")
+            next_max_id = (
+                result.get("next_max_id")
+                or paging_info.get("max_id")
+                or paging_info.get("end_cursor")
+            )
 
             if not items:
                 consecutive_empty_pages += 1
@@ -758,43 +1326,58 @@ class InstagramClient(BasePlatformClient):
             else:
                 consecutive_empty_pages = 0
 
-            if not more_available or not next_max_id or next_max_id == max_id:
+            if not more_available or not next_max_id:
+                break
+            if next_max_id == max_id:
+                print(
+                    "[!] Instagram returned the same Reels cursor twice; "
+                    "stopping pagination to avoid an infinite loop."
+                )
                 break
             max_id = next_max_id
-            pages_fetched += 1
 
-        # If zero items yielded, try fallbacks before checking age restriction
-        if total_items_yielded == 0:
-            # Fallback 1: Posts feed for Reels (media_type == 2 or video_versions)
+        if not yielded_any:
+            fallback_entries = []
+            # Fallback 1: the posts feed also contains video posts and reels.
             try:
-                feed_items = self.fetch_user_raw_posts_paginated(user_id, max_pages=max_pages, username=username)
-                found_any = False
-                for p in feed_items:
-                    if p.get("media_type") == 2 or "video_versions" in p or p.get("is_video"):
-                        found_any = True
-                        total_items_yielded += 1
-                        yield p
-                if found_any:
-                    return
+                for entry in self.fetch_user_raw_posts_paginated(
+                    user_id, max_pages=max_pages, username=username
+                ):
+                    if (
+                        entry.get("media_type") == 2
+                        or "video_versions" in entry
+                        or entry.get("is_video")
+                    ):
+                        identity = str(entry.get("code") or entry.get("pk") or "")
+                        if identity and identity in seen:
+                            continue
+                        if identity:
+                            seen.add(identity)
+                        fallback_entries.append(entry)
             except Exception:
                 pass
 
-            # Fallback 2: Check profile timeline from HTML
-            if username and self.allow_network_fallbacks:
+            # Fallback 2: the profile page's embedded timeline.
+            if not fallback_entries and username and self.allow_network_fallbacks:
                 try:
-                    html_items = list(self._fetch_profile_timeline_from_html(username))
-                    found_any = False
-                    for h in html_items:
-                        if h.get("media_type") == 2 or h.get("is_video"):
-                            found_any = True
-                            total_items_yielded += 1
-                            yield h
-                    if found_any:
-                        return
+                    for entry in self._fetch_profile_timeline_from_html(username):
+                        if entry.get("media_type") == 2 or entry.get("is_video"):
+                            identity = str(entry.get("code") or entry.get("pk") or "")
+                            if identity and identity in seen:
+                                continue
+                            if identity:
+                                seen.add(identity)
+                            fallback_entries.append(entry)
                 except Exception:
                     pass
 
-            # If still 0 items, check if profile is age-restricted
+            if fallback_entries:
+                fallback_entries.sort(key=self._reels_sort_key)
+                for entry in fallback_entries:
+                    yield entry
+                return
+
+            # Check whether the profile is age-restricted before giving up.
             restriction = None
             if username:
                 restriction = self.restricted_profiles.get(username.lower()) or self.check_profile_restriction(username)
@@ -805,7 +1388,7 @@ class InstagramClient(BasePlatformClient):
                     or api_logout_reason is not None
                 )
                 if is_logged_out and (self.cookies_file or self.sessionid):
-                    reported_err = api_error_title or 'You have been logged out'
+                    reported_err = api_error_title or "You have been logged out"
                     raise RuntimeError(
                         f"Cannot download Reels for @{username}: Account is age-restricted ({restriction}). "
                         "The session provided via cookies/sessionid was rejected as EXPIRED or LOGGED OUT "
@@ -826,10 +1409,29 @@ class InstagramClient(BasePlatformClient):
                     )
 
             if api_status_code not in (200,):
+                # require_login=True is Instagram's explicit signal that the
+                # session is expired or logged out, regardless of status code.
+                if api_require_login or api_status_code in (401, 403):
+                    session_hint = ""
+                    if self.cookies_file or self.sessionid:
+                        session_hint = (
+                            " Your cookies.txt session appears to be expired or logged out."
+                            " Please log into Instagram in your browser, re-export a fresh"
+                            " cookies.txt, and retry."
+                        )
+                    raise RuntimeError(
+                        f"Failed to fetch Reels for @{username or user_id}: "
+                        f"Instagram rejected the request (HTTP {api_status_code})."
+                        + session_hint
+                    )
                 raise RuntimeError(
-                    f"Failed to fetch Reels for user {user_id}: "
+                    f"Failed to fetch Reels for @{username or user_id}: "
                     f"Instagram returned HTTP {api_status_code}."
                 )
+            return
+
+        if truncation:
+            raise RuntimeError(truncation)
 
     @staticmethod
     def _parse_dash_manifest_to_root(manifest_input: Any) -> Optional[ET.Element]:

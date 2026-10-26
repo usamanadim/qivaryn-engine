@@ -162,6 +162,63 @@ class StreamMergeUnitTests(unittest.TestCase):
 
         ffmpeg.assert_called()
 
+    def test_video_and_audio_download_concurrently(self):
+        import threading
+        barrier = threading.Barrier(2, timeout=2.0)
+        concurrently_active = False
+
+        def mock_download(url, file_path, desc, headers=None, position=None, **kwargs):
+            nonlocal concurrently_active
+            try:
+                barrier.wait()
+                concurrently_active = True
+                return True
+            except threading.BrokenBarrierError:
+                return False
+
+        with patch.object(self.engine, "_download_file", side_effect=mock_download), \
+             patch("shutil.which", return_value="ffmpeg"), \
+             patch.object(self.engine, "_media_duration", return_value=10.0), \
+             patch.object(self.engine, "_run_ffmpeg") as ffmpeg:
+            ffmpeg.return_value = MagicMock(returncode=0)
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.getsize", return_value=1024), \
+                 patch("os.replace"):
+                success = self.engine._download_video_stream(
+                    video_url="https://cdn.example/v.mp4",
+                    audio_url="https://cdn.example/a.m4a",
+                    file_path=self.output_path,
+                    desc="test parallel",
+                )
+            self.assertTrue(success)
+            self.assertTrue(concurrently_active)
+
+    def test_video_and_audio_share_single_progress_bar(self):
+        bars = []
+
+        def mock_download(url, file_path, desc, **kwargs):
+            bars.append(kwargs.get("progress_bar"))
+            return True
+
+        with patch.object(self.engine, "_download_file", side_effect=mock_download), \
+             patch("shutil.which", return_value="ffmpeg"), \
+             patch.object(self.engine, "_media_duration", return_value=10.0), \
+             patch.object(self.engine, "_run_ffmpeg") as ffmpeg:
+            ffmpeg.return_value = MagicMock(returncode=0)
+            with patch("os.path.exists", return_value=True), \
+                 patch("os.path.getsize", return_value=1024), \
+                 patch("os.replace"):
+                success = self.engine._download_video_stream(
+                    video_url="https://cdn.example/v.mp4",
+                    audio_url="https://cdn.example/a.m4a",
+                    file_path=self.output_path,
+                    desc="test parallel",
+                )
+            self.assertTrue(success)
+            self.assertEqual(len(bars), 2)
+            self.assertIsNotNone(bars[0])
+            self.assertIs(bars[0], bars[1])
+
 
 if __name__ == "__main__":
     unittest.main()

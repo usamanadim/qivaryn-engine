@@ -14,7 +14,7 @@ Qivaryn is a high-performance, multi-platform media downloader with a shared com
 - **Audio & Video Merging**: When a platform provides split video/audio streams (Instagram DASH, YouTube adaptive formats), Qivaryn uses FFmpeg to merge them.
 - **Batch Limits (`--count`)**: Specify the exact number of **new** items to save. Previously downloaded content is skipped without counting toward the quota.
 - **Download Resumption**: Tracks downloaded items per platform in a local SQLite database (`qivaryn_state.db`).
-- **Feed Scanning**: Count available and already-downloaded items without downloading them.
+- **Instagram Feed Scanning**: Count available and already-downloaded profile posts or Reels without downloading them.
 - **Dual Interface**: Offers both a command-line interface (CLI) and a Python library API.
 
 ### Features added in v0.2.1 (included in PyPI 0.2.2)
@@ -28,6 +28,19 @@ Qivaryn is a high-performance, multi-platform media downloader with a shared com
   a positive value stops after that many consecutive already-downloaded items.
   Early exit applies when `--count` is not set.
 
+### Improvements in v0.2.3
+
+- **More reliable Instagram sessions and media lookup**: Checks session validity
+  before reporting an expired login and tries the website and public embed
+  routes when the app API cannot resolve a post or Reel.
+- **Reliable Reel ordering and pagination**: Pinned Reels stay first, remaining
+  Reels are sorted newest-first, duplicate items and repeated cursors are
+  handled safely, and later-page errors are surfaced instead of appearing as
+  the end of a feed.
+- **More resilient transfers**: Retries transient Instagram requests and media
+  download failures. YouTube streams use bounded range requests when supported,
+  and separate audio/video streams are downloaded concurrently before merging.
+
 ### Supported platforms
 
 | Platform | Single items | Account feeds | Playlists | Notes |
@@ -38,6 +51,40 @@ Qivaryn is a high-performance, multi-platform media downloader with a shared com
 | **Facebook** | Videos, Reels | Page videos tab (best effort) | — | Single videos work anonymously; some page feeds need a session |
 
 Run `qivaryn platforms` to see the available platforms and filters in your installed version.
+
+---
+
+## Project Structure
+
+```text
+qivaryn-engine/
+├── .github/workflows/
+│   ├── ci.yml               # Tests and distribution build
+│   └── publish.yml          # Release publishing
+├── qivaryn/
+│   ├── examples/
+│   │   └── library_usage.py  # Python API example
+│   ├── platforms/
+│   │   ├── base.py           # Shared platform contract
+│   │   ├── facebook.py
+│   │   ├── scrape.py         # Shared scraping helpers
+│   │   ├── tiktok.py
+│   │   └── youtube.py
+│   ├── ATTRIBUTION.json
+│   ├── cli.py                # Command-line interface
+│   ├── client.py             # Instagram client
+│   ├── database.py           # SQLite download-state tracking
+│   ├── downloader.py         # Download engine and media transfers
+│   └── files.py              # Output paths and file handling
+├── tests/                    # Unit and regression tests
+├── LICENSE
+├── README.md
+├── pyproject.toml            # Package metadata and CLI entry point
+└── requirements.txt
+```
+
+The platform-specific clients for TikTok, YouTube, and Facebook live in
+`qivaryn/platforms/`; the Instagram client lives in `qivaryn/client.py`.
 
 ---
 
@@ -168,15 +215,18 @@ qivaryn "<SUPPORTED_URL>" [OPTIONS]
 
 ### Scan without downloading
 
-Use `qivaryn scan` to count items in a supported account feed and see how many
-are already downloaded and how many remain:
+Use `qivaryn scan` to count items in an Instagram profile feed (posts or Reels)
+and see how many are already downloaded and how many remain:
 
 ```console
 qivaryn scan "https://www.instagram.com/USERNAME/"
 qivaryn scan "https://www.instagram.com/USERNAME/reels/" --cookies cookies.txt
 ```
 
-Single-item URLs are identified without fetching or downloading the item.
+The CLI scan command currently supports Instagram profile URLs. Single-item
+URLs are identified without fetching or downloading the item. The Python API's
+`scan_account()` method can also scan an account on the engine's selected
+platform.
 
 ### 2. Explicit Subcommands
 
@@ -352,9 +402,9 @@ from qivaryn import InstagramClient, TikTokClient, YouTubeClient, FacebookClient
 ```
 
 > [!TIP]
-> Set `allow_network_fallbacks=False` to disable the secondary unauthenticated
-> requests Qivaryn makes when a session expires (clean retries and HTML timeline
-> scraping). This is useful for offline runs and keeps unit tests off the network.
+> Set `allow_network_fallbacks=False` to disable secondary website, embed, and
+> unauthenticated requests used when Instagram's app API cannot resolve content.
+> This is useful for offline runs and keeps unit tests off the network.
 
 See [`qivaryn/examples/library_usage.py`](qivaryn/examples/library_usage.py) for a complete runnable script.
 

@@ -6,10 +6,13 @@ reporting and state persistence.  Service-specific work lives in the client
 classes under :mod:`qivaryn.platforms`.
 """
 
+import concurrent.futures
+from contextlib import nullcontext
 import os
 import re
 import shutil
 import subprocess
+import threading
 from typing import Callable, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -76,7 +79,26 @@ class QivarynEngine:
         self._current_account = ""
         #: Cached listing of the files below the output directory.
         self._output_scan: Optional[List[Tuple[str, str]]] = None
+        #: Items that failed during the current run, so they can be reported.
+        self.failed_items: List[dict] = []
+        self._tls = threading.local()
+        self._default_last_http_status: Optional[int] = None
         os.makedirs(self.output_dir, exist_ok=True)
+
+    @property
+    def _last_http_status(self) -> Optional[int]:
+        tls = getattr(self, "_tls", None)
+        if tls is None:
+            return getattr(self, "_default_last_http_status", None)
+        return getattr(tls, "last_http_status", None)
+
+    @_last_http_status.setter
+    def _last_http_status(self, val: Optional[int]) -> None:
+        tls = getattr(self, "_tls", None)
+        if tls is None:
+            self._default_last_http_status = val
+        else:
+            tls.last_http_status = val
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -467,6 +489,7 @@ class QivarynEngine:
         if count is not None and count <= 0:
             raise ValueError("Count must be a positive integer greater than 0.")
 
+        self.failed_items = []
         feeds = self.client.feeds_for(media_type_filter)
         if not feeds:
             raise ValueError(
@@ -505,6 +528,17 @@ class QivarynEngine:
                 total_skipped += skipped
         finally:
             self._current_account = previous_account
+
+        if self.failed_items:
+            print(
+                f"\n[!] {len(self.failed_items)} item(s) could not be downloaded. "
+                "They were not saved to the state database, so the next run "
+                "will retry them:"
+            )
+            for failure in self.failed_items[:20]:
+                print(f"    - {failure['id']}: {failure['reason']}")
+            if len(self.failed_items) > 20:
+                print(f"    ... and {len(self.failed_items) - 20} more.")
 
         if total_downloaded or total_skipped:
             skip_str = (
@@ -558,11 +592,9 @@ class QivarynEngine:
             print(f"\n[-] Failed to fetch {feed.name} for {label}: {exc}")
             return 0, 0
 
-        try:
-            return self._scan_items(items, label, filter_mode, count, force)
-        except RuntimeError as exc:
-            print(f"\n[-] Failed to fetch {feed.name} for {label}: {exc}")
-            return 0, 0
+        # ``_scan_items`` keeps the counts it already reached when the feed is
+        # truncated mid-stream, so a partial failure never loses progress.
+        return self._scan_items(items, label, filter_mode, count, force)
 
     def _scan_items(
         self,
@@ -572,21 +604,46 @@ class QivarynEngine:
         count: Optional[int],
         force: bool,
     ) -> Tuple[int, int]:
-        """Applies filtering, resume checks and batch limits to a raw item stream."""
+        """Applies filtering, resume checks and batch limits to a raw item stream.
+
+        Repeats are dropped, each item is handled on its own so one broken reel
+        cannot stop the feed, and failures are collected for a final report.
+        """
         filter_mode = (media_type_filter or "all").lower()
         known = self.db.get_all_downloaded_shortcodes(self.platform)
         consecutive_known = 0
         downloaded = 0
         skipped = 0
+        seen = set()
+        iterator = iter(items)
 
-        for raw in items:
+        while True:
             if count is not None and downloaded >= count:
                 break
+
+            try:
+                raw = next(iterator)
+            except StopIteration:
+                break
+            except RuntimeError as exc:
+                # The feed reported that older pages could not be fetched.
+                print(f"\n[-] {label}: {exc}")
+                print(
+                    "[!] Stopped early, so older items (if any) were not "
+                    "downloaded. Run again to fetch the rest."
+                )
+                break
+
+            if not isinstance(raw, dict):
+                continue
 
             item_id = self.client.item_id(raw)
             if not item_id:
                 continue
             item_id = str(item_id)
+            if item_id in seen:
+                continue
+            seen.add(item_id)
 
             if not self.client.prefilter(raw, filter_mode):
                 continue
@@ -606,16 +663,29 @@ class QivarynEngine:
                 continue
             consecutive_known = 0
 
-            try:
-                item = self.client.normalize_item(raw)
-            except Exception as exc:
-                print(f"[-] Could not fetch full details for {item_id}: {exc}")
+            item = self._normalize_raw_item(raw, item_id)
+            if item is None:
+                self._record_failure(item_id, "could not read item details")
                 continue
 
             if not self.client.matches_filter(item.get("media_type"), filter_mode):
                 continue
 
-            result = self._download_media_item(item, force=force)
+            try:
+                result = self._download_media_item(item, force=force)
+                if result is False and self.platform == "instagram":
+                    refreshed = self._refetch_item(item_id)
+                    if refreshed is not None:
+                        print(
+                            f"[*] Retrying {item_id} with fresh Instagram "
+                            "metadata..."
+                        )
+                        result = self._download_media_item(refreshed, force=force)
+            except Exception as exc:
+                print(f"[-] Download failed for {item_id}: {exc}")
+                self._record_failure(item_id, str(exc))
+                continue
+
             if result is None:
                 continue
             if result:
@@ -627,8 +697,50 @@ class QivarynEngine:
                     if downloaded >= count:
                         print(f"\n[+] Successfully reached target of {count} new items!")
                         break
+            else:
+                self._record_failure(item_id, "download failed")
 
         return downloaded, skipped
+
+    def _normalize_raw_item(self, raw: dict, item_id: str) -> Optional[dict]:
+        """Turns a raw feed entry into a media dict, fetching full details if needed.
+
+        The HTML fallback only provides shortcodes, so those entries are
+        hydrated from the media page before they can be downloaded.
+        """
+        if raw.get("_needs_full_fetch"):
+            try:
+                fetched = self.client.fetch_item(item_id)
+            except Exception as exc:
+                print(f"[-] Could not fetch full details for {item_id}: {exc}")
+                return None
+            if not isinstance(fetched, dict) or not fetched:
+                print(f"[-] Could not fetch full details for {item_id}.")
+                return None
+            raw = fetched
+
+        try:
+            return self.client.normalize_item(raw)
+        except Exception as exc:
+            print(f"[-] Could not fetch full details for {item_id}: {exc}")
+            return None
+
+    def _refetch_item(self, item_id: str) -> Optional[dict]:
+        """Re-reads an item's metadata to obtain fresh media URLs."""
+        try:
+            raw = self.client.fetch_item(item_id)
+        except Exception as exc:
+            print(f"[-] Could not refresh details for {item_id}: {exc}")
+            return None
+        if not isinstance(raw, dict) or not raw:
+            return None
+        return self._normalize_raw_item(raw, item_id)
+
+    def _record_failure(self, item_id: str, reason: str) -> None:
+        """Remembers a failed item so the user and the next run can retry it."""
+        if any(entry["id"] == item_id for entry in self.failed_items):
+            return
+        self.failed_items.append({"id": item_id, "reason": reason})
 
     # ------------------------------------------------------------------
     # Media writing
@@ -771,10 +883,39 @@ class QivarynEngine:
             temp_a = f"{file_path}.temp_a.{audio_ext}"
             temp_output = f"{file_path}.temp_mux.{ext}"
             container_args = ["-movflags", "+faststart"] if ext == "mp4" else []
+            progress_lock = threading.Lock()
             try:
-                if not self._download_file(video_url, temp_v, f"{desc} [Video]", headers=headers):
-                    return False
-                if not self._download_file(audio_url, temp_a, f"{desc} [Audio]", headers=headers):
+                with tqdm(
+                    desc=desc,
+                    total=None,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    leave=False,
+                ) as shared_bar:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        v_future = executor.submit(
+                            self._download_file,
+                            video_url,
+                            temp_v,
+                            desc,
+                            headers=headers,
+                            progress_bar=shared_bar,
+                            progress_lock=progress_lock,
+                        )
+                        a_future = executor.submit(
+                            self._download_file,
+                            audio_url,
+                            temp_a,
+                            desc,
+                            headers=headers,
+                            progress_bar=shared_bar,
+                            progress_lock=progress_lock,
+                        )
+                        v_ok = v_future.result()
+                        a_ok = a_future.result()
+
+                if not v_ok or not a_ok:
                     return False
 
                 if not self._audio_matches_video(
@@ -950,11 +1091,59 @@ class QivarynEngine:
         file_path: str,
         desc: str,
         headers: Optional[dict] = None,
+        position: Optional[int] = None,
+        progress_bar: Optional[tqdm] = None,
+        progress_lock: Optional[threading.Lock] = None,
     ) -> bool:
+        """Downloads ``url`` to ``file_path``, retrying once on transient errors.
+
+        Missing or expired media (4xx other than 429) will not improve by
+        asking again, so the caller refreshes the item's metadata instead.
+        """
         if not url:
             print(f"[-] No download URL available for {desc}.")
             return False
 
+        self._last_http_status = None
+        if self._download_file_stream(
+            url,
+            file_path,
+            desc,
+            headers,
+            position=position,
+            progress_bar=progress_bar,
+            progress_lock=progress_lock,
+        ):
+            return True
+
+        status = self._last_http_status
+        retryable = status == 0 or status == 429 or (status is not None and status >= 500)
+        if not retryable:
+            return False
+
+        self._remove_partial_file(file_path)
+        print(f"[*] Temporary failure for {desc}; retrying once...")
+        self._last_http_status = None
+        return self._download_file_stream(
+            url,
+            file_path,
+            desc,
+            headers,
+            position=position,
+            progress_bar=progress_bar,
+            progress_lock=progress_lock,
+        )
+
+    def _download_file_stream(
+        self,
+        url: str,
+        file_path: str,
+        desc: str,
+        headers: Optional[dict] = None,
+        position: Optional[int] = None,
+        progress_bar: Optional[tqdm] = None,
+        progress_lock: Optional[threading.Lock] = None,
+    ) -> bool:
         request_headers = {"Accept-Encoding": "identity"}
         request_headers.update(headers or {})
 
@@ -962,39 +1151,97 @@ class QivarynEngine:
             # YouTube's media CDN now rejects full GETs (403) or throttles them
             # to a crawl; bounded range requests are both accepted and fast.
             return self._download_file_in_ranges(
-                url, file_path, desc, request_headers
+                url,
+                file_path,
+                desc,
+                request_headers,
+                position=position,
+                progress_bar=progress_bar,
+                progress_lock=progress_lock,
             )
 
+        bytes_written = 0
+        stream_total = 0
         try:
             with self.client.session.get(
                 url, stream=True, timeout=30, headers=request_headers
             ) as response:
+                self._last_http_status = response.status_code
                 if response.status_code != 200:
                     print(f"[-] Download request failed for {desc}: HTTP {response.status_code}.")
                     return False
 
-                total_size = int(response.headers.get("content-length", 0))
-                bytes_written = 0
-                with open(file_path, "wb") as file, tqdm(
-                    desc=desc,
-                    total=total_size,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    leave=False,
-                ) as bar:
+                stream_total = int(response.headers.get("content-length", 0))
+                if progress_bar is not None and stream_total > 0:
+                    if progress_lock:
+                        with progress_lock:
+                            progress_bar.total = (progress_bar.total or 0) + stream_total
+                            progress_bar.refresh()
+                    else:
+                        progress_bar.total = (progress_bar.total or 0) + stream_total
+                        progress_bar.refresh()
+
+                bar_context = (
+                    nullcontext()
+                    if progress_bar is not None
+                    else tqdm(
+                        desc=desc,
+                        total=stream_total,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        leave=False,
+                        position=position,
+                    )
+                )
+                with open(file_path, "wb") as file, bar_context as local_bar:
                     for chunk in response.iter_content(chunk_size=65536):
                         if chunk:
                             file.write(chunk)
-                            bytes_written += len(chunk)
-                            bar.update(len(chunk))
+                            chunk_len = len(chunk)
+                            bytes_written += chunk_len
+                            if progress_bar is not None:
+                                if progress_lock:
+                                    with progress_lock:
+                                        progress_bar.update(chunk_len)
+                                else:
+                                    progress_bar.update(chunk_len)
+                            else:
+                                local_bar.update(chunk_len)
             if bytes_written == 0:
                 print(f"[-] Download returned an empty file for {desc}.")
+                if progress_bar is not None and stream_total > 0:
+                    if progress_lock:
+                        with progress_lock:
+                            if progress_bar.total is not None:
+                                progress_bar.total = max(0, progress_bar.total - stream_total)
+                            progress_bar.refresh()
+                    else:
+                        if progress_bar.total is not None:
+                            progress_bar.total = max(0, progress_bar.total - stream_total)
+                        progress_bar.refresh()
                 os.remove(file_path)
                 return False
             return True
         except (requests.RequestException, OSError) as exc:
+            if isinstance(exc, requests.RequestException):
+                # Network-level failure: safe to retry once.
+                self._last_http_status = 0
             print(f"[-] Could not download {desc}: {exc}")
+            if progress_bar is not None:
+                if progress_lock:
+                    with progress_lock:
+                        if bytes_written > 0:
+                            progress_bar.update(-bytes_written)
+                        if stream_total > 0 and progress_bar.total is not None:
+                            progress_bar.total = max(0, progress_bar.total - stream_total)
+                        progress_bar.refresh()
+                else:
+                    if bytes_written > 0:
+                        progress_bar.update(-bytes_written)
+                    if stream_total > 0 and progress_bar.total is not None:
+                        progress_bar.total = max(0, progress_bar.total - stream_total)
+                    progress_bar.refresh()
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
@@ -1017,6 +1264,9 @@ class QivarynEngine:
         file_path: str,
         desc: str,
         headers: Optional[dict] = None,
+        position: Optional[int] = None,
+        progress_bar: Optional[tqdm] = None,
+        progress_lock: Optional[threading.Lock] = None,
     ) -> bool:
         """Downloads a YouTube stream in bounded range requests.
 
@@ -1032,6 +1282,7 @@ class QivarynEngine:
             with self.client.session.get(
                 url, headers=probe_headers, stream=True, timeout=30
             ) as probe:
+                self._last_http_status = probe.status_code
                 if probe.status_code not in (200, 206):
                     print(
                         f"[-] Download request failed for {desc}: "
@@ -1042,6 +1293,7 @@ class QivarynEngine:
                 if match and match.group(3) != "*":
                     total_size = int(match.group(3))
         except requests.RequestException as exc:
+            self._last_http_status = 0
             print(f"[-] Could not download {desc}: {exc}")
             return False
 
@@ -1053,17 +1305,32 @@ class QivarynEngine:
         else:
             chunk_size = 1024 * 1024
 
+        if progress_bar is not None and total_size > 0:
+            if progress_lock:
+                with progress_lock:
+                    progress_bar.total = (progress_bar.total or 0) + total_size
+                    progress_bar.refresh()
+            else:
+                progress_bar.total = (progress_bar.total or 0) + total_size
+                progress_bar.refresh()
+
         bytes_written = 0
         failure: Optional[str] = None
-        try:
-            with open(file_path, "wb") as file, tqdm(
+        bar_context = (
+            nullcontext()
+            if progress_bar is not None
+            else tqdm(
                 desc=desc,
                 total=total_size or None,
                 unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
                 leave=False,
-            ) as bar:
+                position=position,
+            )
+        )
+        try:
+            with open(file_path, "wb") as file, bar_context as local_bar:
                 while total_size == 0 or bytes_written < total_size:
                     start = bytes_written
                     end = start + chunk_size - 1
@@ -1082,9 +1349,19 @@ class QivarynEngine:
                             for chunk in response.iter_content(chunk_size=65536):
                                 if chunk:
                                     file.write(chunk)
-                                    bar.update(len(chunk))
+                                    chunk_len = len(chunk)
+                                    bytes_written += chunk_len
+                                    if progress_bar is not None:
+                                        if progress_lock:
+                                            with progress_lock:
+                                                progress_bar.update(chunk_len)
+                                        else:
+                                            progress_bar.update(chunk_len)
+                                    else:
+                                        local_bar.update(chunk_len)
                             return True
                         if response.status_code != 206:
+                            self._last_http_status = response.status_code
                             failure = f"HTTP {response.status_code}"
                             break
 
@@ -1094,14 +1371,31 @@ class QivarynEngine:
                             )
                             if match and match.group(3) != "*":
                                 total_size = int(match.group(3))
-                                bar.total = total_size
+                                if progress_bar is not None:
+                                    if progress_lock:
+                                        with progress_lock:
+                                            progress_bar.total = (progress_bar.total or 0) + total_size
+                                            progress_bar.refresh()
+                                    else:
+                                        progress_bar.total = (progress_bar.total or 0) + total_size
+                                        progress_bar.refresh()
+                                else:
+                                    local_bar.total = total_size
 
                         written = 0
                         for chunk in response.iter_content(chunk_size=65536):
                             if chunk:
                                 file.write(chunk)
-                                written += len(chunk)
-                                bar.update(len(chunk))
+                                chunk_len = len(chunk)
+                                written += chunk_len
+                                if progress_bar is not None:
+                                    if progress_lock:
+                                        with progress_lock:
+                                            progress_bar.update(chunk_len)
+                                    else:
+                                        progress_bar.update(chunk_len)
+                                else:
+                                    local_bar.update(chunk_len)
                         if written == 0:
                             break
                         bytes_written += written
@@ -1110,15 +1404,41 @@ class QivarynEngine:
                         if not total_size and written < (end - start + 1):
                             break
         except (requests.RequestException, OSError) as exc:
+            if isinstance(exc, requests.RequestException):
+                self._last_http_status = 0
             failure = str(exc)
 
         if failure:
             print(f"[-] Download request failed for {desc}: {failure}.")
+            if progress_bar is not None:
+                if progress_lock:
+                    with progress_lock:
+                        if bytes_written > 0:
+                            progress_bar.update(-bytes_written)
+                        if total_size > 0 and progress_bar.total is not None:
+                            progress_bar.total = max(0, progress_bar.total - total_size)
+                        progress_bar.refresh()
+                else:
+                    if bytes_written > 0:
+                        progress_bar.update(-bytes_written)
+                    if total_size > 0 and progress_bar.total is not None:
+                        progress_bar.total = max(0, progress_bar.total - total_size)
+                    progress_bar.refresh()
             self._remove_partial_file(file_path)
             return False
 
         if bytes_written == 0:
             print(f"[-] Download returned an empty file for {desc}.")
+            if progress_bar is not None and total_size > 0:
+                if progress_lock:
+                    with progress_lock:
+                        if progress_bar.total is not None:
+                            progress_bar.total = max(0, progress_bar.total - total_size)
+                        progress_bar.refresh()
+                else:
+                    if progress_bar.total is not None:
+                        progress_bar.total = max(0, progress_bar.total - total_size)
+                    progress_bar.refresh()
             self._remove_partial_file(file_path)
             return False
         if total_size and bytes_written != total_size:
@@ -1126,6 +1446,20 @@ class QivarynEngine:
                 f"[-] Incomplete download for {desc}: "
                 f"{bytes_written}/{total_size} bytes."
             )
+            if progress_bar is not None:
+                if progress_lock:
+                    with progress_lock:
+                        if bytes_written > 0:
+                            progress_bar.update(-bytes_written)
+                        if total_size > 0 and progress_bar.total is not None:
+                            progress_bar.total = max(0, progress_bar.total - total_size)
+                        progress_bar.refresh()
+                else:
+                    if bytes_written > 0:
+                        progress_bar.update(-bytes_written)
+                    if total_size > 0 and progress_bar.total is not None:
+                        progress_bar.total = max(0, progress_bar.total - total_size)
+                    progress_bar.refresh()
             self._remove_partial_file(file_path)
             return False
         return True

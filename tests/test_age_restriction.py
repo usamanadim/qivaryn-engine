@@ -44,7 +44,8 @@ class TestAgeRestrictionAndSession(unittest.TestCase):
         mock_html_resp.status_code = 200
         mock_html_resp.text = '{"failure_reason":"MA","restricted_age":19,"page_type":"MEDIA"}'
 
-        with patch.object(client.session, "get", side_effect=[mock_mobile_resp, mock_html_resp, mock_html_resp]):
+        with patch.object(client, "_session_is_valid", return_value=False), \
+             patch.object(client.session, "get", side_effect=[mock_mobile_resp, mock_html_resp, mock_html_resp]):
             with self.assertRaises(RuntimeError) as ctx:
                 client.fetch_post_by_shortcode("AgeGatedShortcode")
             self.assertIn("logged out", str(ctx.exception).lower())
