@@ -1164,6 +1164,127 @@ class InstagramClient(BasePlatformClient):
             return (1, 1, 0)
         return (1, 0, -timestamp)
 
+    def _fetch_user_reels_graphql(
+        self,
+        user_id: str,
+        max_pages: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> Generator[dict, None, None]:
+        """Fetches the Reels tab via Instagram Web's GraphQL endpoint.
+
+        PolarisProfileReelsTabContentQuery (doc_id: 24127588873492897) returns
+        the exact Reels tab in native web order: pinned reels first, followed
+        by all reels in descending chronological order, without skipping
+        reels shared to the profile feed.
+        """
+        doc_id = "24127588873492897"
+        cursor = None
+        pages_fetched = 0
+        seen = set()
+
+        while max_pages is None or pages_fetched < max_pages:
+            variables = {
+                "data": {
+                    "include_feed_video": True,
+                    "page_size": 24,
+                    "target_user_id": int(user_id) if str(user_id).isdigit() else user_id,
+                }
+            }
+            if cursor:
+                variables["data"]["max_id"] = cursor
+
+            headers = self._web_api_headers()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = {
+                "doc_id": doc_id,
+                "variables": json.dumps(variables),
+            }
+            response = self._request_with_retries(
+                lambda: self.session.post(
+                    "https://www.instagram.com/graphql/query",
+                    data=data,
+                    headers=headers,
+                    timeout=15,
+                )
+            )
+            pages_fetched += 1
+            if response is None or response.status_code != 200:
+                break
+
+            try:
+                result = response.json()
+            except Exception:
+                break
+
+            if not isinstance(result, dict):
+                break
+
+            # Handle direct items list (mock responses or legacy payload)
+            if "items" in result:
+                items = result.get("items") or []
+                page_entries = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    entry = self._reels_entry(item)
+                    identity = str(entry.get("code") or entry.get("pk") or "")
+                    if identity:
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                    page_entries.append(entry)
+
+                page_entries.sort(key=self._reels_sort_key)
+                for entry in page_entries:
+                    yield entry
+
+                paging_info = result.get("paging_info") or {}
+                if not paging_info.get("more_available") or not (result.get("next_max_id") or paging_info.get("max_id")):
+                    break
+                cursor = result.get("next_max_id") or paging_info.get("max_id")
+                continue
+
+            data_obj = result.get("data") if isinstance(result, dict) else None
+            conn = (
+                data_obj.get("xdt_api__v1__clips__user__connection_v2")
+                if isinstance(data_obj, dict)
+                else None
+            )
+            if not isinstance(conn, dict):
+                break
+
+            edges = conn.get("edges") or []
+            if not edges and pages_fetched == 1:
+                break
+
+            page_entries = []
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                node = edge.get("node") or {}
+                media = node.get("media") or node
+                if not isinstance(media, dict):
+                    continue
+                entry = dict(media)
+                entry["_needs_full_fetch"] = True
+                identity = str(entry.get("code") or entry.get("pk") or "")
+                if identity:
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                page_entries.append(entry)
+
+            page_entries.sort(key=self._reels_sort_key)
+            for entry in page_entries:
+                yield entry
+
+            page_info = conn.get("page_info") or {}
+            has_next = page_info.get("has_next_page", False)
+            end_cursor = page_info.get("end_cursor")
+            if not has_next or not end_cursor or end_cursor == cursor:
+                break
+            cursor = end_cursor
+
     def fetch_user_raw_reels_paginated(
         self,
         user_id: str,
@@ -1195,12 +1316,21 @@ class InstagramClient(BasePlatformClient):
         consecutive_empty_pages = 0
         truncation: Optional[str] = None
 
+        # Route 1: When browser session cookies are available, use the official Web GraphQL Reels tab query
+        if self.cookies_file:
+            try:
+                for entry in self._fetch_user_reels_graphql(user_id, max_pages=max_pages, username=username):
+                    yielded_any = True
+                    yield entry
+                if yielded_any:
+                    return
+            except Exception:
+                pass
+
         while max_pages is None or pages_fetched < max_pages:
             data = {"target_user_id": user_id, "page_size": 12}
             if max_id:
                 data["max_id"] = max_id
-            # Browser-exported cookies are web sessions, so ask as the website
-            # first; app sessions (--sessionid) ask as the app first.
             first_headers = self._web_api_headers() if self.cookies_file else None
             response = self._request_with_retries(
                 lambda: self.session.post(

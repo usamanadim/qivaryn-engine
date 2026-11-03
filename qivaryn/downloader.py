@@ -717,6 +717,8 @@ class QivarynEngine:
             if not isinstance(fetched, dict) or not fetched:
                 print(f"[-] Could not fetch full details for {item_id}.")
                 return None
+            if "video_url" in fetched or ("shortcode" in fetched and "id" not in fetched):
+                return fetched
             raw = fetched
 
         try:
