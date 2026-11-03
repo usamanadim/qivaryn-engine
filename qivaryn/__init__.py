@@ -5,7 +5,7 @@ from .platforms import FacebookClient, TikTokClient, YouTubeClient
 
 InstagramEngine = QivarynEngine
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 __all__ = [
     "QivarynEngine",
     "InstagramEngine",
