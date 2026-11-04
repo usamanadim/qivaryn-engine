@@ -455,5 +455,172 @@ class DownloadRetryTests(unittest.TestCase):
         self.assertEqual(get.call_count, 1)
 
 
+class MergedVisibleAndHiddenReelsTests(unittest.TestCase):
+    """Tests that visible reels (Web GraphQL) and hidden reels (mobile clips)
+    are both detected, deduplicated, and yielded in strict chronological order.
+    """
+
+    def setUp(self):
+        self.client = InstagramClient(allow_network_fallbacks=False)
+        self.client.cookies_file = "cookies.txt"
+
+    def _graphql_edge(self, code, taken_at=None, is_pinned=False):
+        media = {
+            "code": code,
+            "pk": f"pk_{code}",
+            "media_type": 2,
+            "is_pinned": is_pinned,
+        }
+        if taken_at is not None:
+            media["taken_at"] = taken_at
+        return {"node": {"media": media}}
+
+    def _graphql_page(self, edges, has_next=False, end_cursor=None):
+        return {
+            "data": {
+                "xdt_api__v1__clips__user__connection_v2": {
+                    "edges": edges,
+                    "page_info": {
+                        "has_next_page": has_next,
+                        "end_cursor": end_cursor,
+                    },
+                }
+            }
+        }
+
+    def _collect_merged(self, graphql_pages, mobile_pages):
+        g_pages = list(graphql_pages)
+        m_pages = list(mobile_pages)
+
+        def mock_post(url, *args, **kwargs):
+            if "graphql" in url:
+                if g_pages:
+                    return _response(g_pages.pop(0))
+                return _response({})
+            elif "clips/user" in url:
+                if m_pages:
+                    return _response(m_pages.pop(0))
+                return _response({"items": [], "paging_info": {"more_available": False}})
+            return _response({})
+
+        with patch.object(self.client.session, "post", side_effect=mock_post), \
+             patch("qivaryn.client.time.sleep"):
+            items = list(self.client.fetch_user_raw_reels_paginated("123"))
+        return [item["code"] for item in items]
+
+    def test_hidden_reels_are_merged_in_strict_chronological_order(self):
+        # Web GraphQL returns visible reels A (1000) and C (800)
+        g_pages = [
+            self._graphql_page([
+                self._graphql_edge("REEL_A", 1000),
+                self._graphql_edge("REEL_C", 800),
+            ])
+        ]
+        # Mobile clips returns visible + hidden reels:
+        # A (1000), B_HIDDEN (900), C (800), D_HIDDEN (700)
+        m_pages = [
+            {
+                "items": [
+                    _reel("REEL_A", 1000),
+                    _reel("REEL_B_HIDDEN", 900),
+                    _reel("REEL_C", 800),
+                    _reel("REEL_D_HIDDEN", 700),
+                ],
+                "paging_info": {"more_available": False},
+            }
+        ]
+
+        codes = self._collect_merged(g_pages, m_pages)
+        # All reels detected, deduplicated, and strictly ordered by timestamp
+        self.assertEqual(codes, ["REEL_A", "REEL_B_HIDDEN", "REEL_C", "REEL_D_HIDDEN"])
+
+    def test_pinned_reels_precede_both_visible_and_hidden_reels(self):
+        g_pages = [
+            self._graphql_page([
+                self._graphql_edge("REEL_VIS", 500),
+            ])
+        ]
+        m_pages = [
+            {
+                "items": [
+                    {"media": {"code": "PINNED", "media_type": 2, "taken_at": 10, "is_pinned": True}},
+                    _reel("REEL_HIDDEN", 600),
+                ],
+                "paging_info": {"more_available": False},
+            }
+        ]
+
+        codes = self._collect_merged(g_pages, m_pages)
+        # PINNED first, then REEL_HIDDEN (600) before REEL_VIS (500)
+        self.assertEqual(codes, ["PINNED", "REEL_HIDDEN", "REEL_VIS"])
+
+    def test_afreen_khan_jump_does_not_skip_chronological_reels(self):
+        # Simulating Afreen Khan's account:
+        # GraphQL has the true top reels in order: PIN_1, R2, R3, R4, R5, R6
+        g_pages = [
+            self._graphql_page([
+                self._graphql_edge("PIN_1", 10, is_pinned=True),
+                self._graphql_edge("R2", 900),
+                self._graphql_edge("R3", 850),
+                self._graphql_edge("R4", 800),
+                self._graphql_edge("R5", 750),
+                self._graphql_edge("R6", 700),
+            ])
+        ]
+        # Mobile clips returned PIN_1, but then jumped to R31, R33, R40 (older timestamps)
+        m_pages = [
+            {
+                "items": [
+                    {"media": {"code": "PIN_1", "media_type": 2, "taken_at": 10, "is_pinned": True}},
+                    _reel("R31", 200),
+                    _reel("R33", 180),
+                    _reel("R40", 150),
+                ],
+                "paging_info": {"more_available": False},
+            }
+        ]
+
+        codes = self._collect_merged(g_pages, m_pages)
+        # First 6 reels must be PIN_1, R2, R3, R4, R5, R6 in sequence
+        self.assertEqual(codes[:6], ["PIN_1", "R2", "R3", "R4", "R5", "R6"])
+        # Followed by the older reels R31, R33, R40
+        self.assertEqual(codes[6:], ["R31", "R33", "R40"])
+
+    def test_only_hidden_reels_when_graphql_empty(self):
+        g_pages = [
+            self._graphql_page([])
+        ]
+        m_pages = [
+            {
+                "items": [
+                    _reel("H1", 500),
+                    _reel("H2", 400),
+                ],
+                "paging_info": {"more_available": False},
+            }
+        ]
+
+        codes = self._collect_merged(g_pages, m_pages)
+        self.assertEqual(codes, ["H1", "H2"])
+
+    def test_only_visible_reels_when_mobile_empty(self):
+        g_pages = [
+            self._graphql_page([
+                self._graphql_edge("V1", 500),
+                self._graphql_edge("V2", 400),
+            ])
+        ]
+        m_pages = [
+            {
+                "items": [],
+                "paging_info": {"more_available": False},
+            }
+        ]
+
+        codes = self._collect_merged(g_pages, m_pages)
+        self.assertEqual(codes, ["V1", "V2"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,21 @@ class InstagramClient(BasePlatformClient):
     #: App ID the website sends; used for the web JSON fallback.
     WEB_APP_ID = "936619743392459"
 
+    #: Capabilities payload the official Android app sends to unlock 1080p DASH streams.
+    #: Without this, Instagram's CDN caps the DASH manifest to 720p for web/API requests.
+    SUPPORTED_CAPABILITIES_NEW = json.dumps([
+        {"name": "SUPPORTED_SDK_VERSIONS",
+         "value": ("114.0,115.0,116.0,117.0,118.0,119.0,120.0,121.0,122.0,123.0,"
+                   "124.0,125.0,126.0,127.0,128.0,129.0,130.0,131.0,132.0,133.0,"
+                   "134.0,135.0,136.0,137.0,138.0,139.0,140.0,141.0,142.0,143.0,"
+                   "144.0,145.0")},
+        {"name": "FACE_TRACKER_VERSION", "value": "14"},
+        {"name": "segmentation", "value": "segmentation_enabled"},
+        {"name": "COMPRESSION", "value": "ETC2_COMPRESSION"},
+        {"name": "world_tracker", "value": "world_tracker_enabled"},
+        {"name": "gyroscope", "value": "gyroscope_enabled"},
+    ])
+
     #: Cookies that must also be available on ``i.instagram.com``.
     _SHARED_COOKIES = ("sessionid", "csrftoken", "ds_user_id", "mid", "ig_did")
 
@@ -426,12 +441,21 @@ class InstagramClient(BasePlatformClient):
         # Browser-exported cookies belong to the website, so ask as the website
         # first. Sessions created by --sessionid are asked for as the app first.
         # The other identity is tried when fallbacks are enabled.
+        app_headers = {
+            "User-Agent": self.MOBILE_USER_AGENT,
+            "X-IG-App-ID": self.MOBILE_APP_ID,
+            "X-IG-Capabilities": "36r/F/8=",
+            "X-IG-Connection-Type": "WIFI",
+            "X-IG-Bandwidth-Speed-KBPS": "25000",
+            "X-IG-Connection-Speed": "25000kbps",
+            "X-FB-HTTP-Engine": "Liger",
+        }
         if self.cookies_file:
             attempts = [("website", web_url, self._web_api_headers())]
             if self.allow_network_fallbacks:
-                attempts.append(("app", app_url, None))
+                attempts.append(("app", app_url, app_headers))
         else:
-            attempts = [("app", app_url, None)]
+            attempts = [("app", app_url, app_headers)]
             if self.allow_network_fallbacks:
                 attempts.append(("website", web_url, self._web_api_headers()))
 
@@ -694,6 +718,10 @@ class InstagramClient(BasePlatformClient):
                 converted["video_versions"] = [
                     {"url": node["video_url"], "width": node_width, "height": node_height}
                 ]
+                for m_key in ("video_dash_manifest", "dash_manifest", "audio_dash_manifest"):
+                    m_val = node.get(m_key) or media.get(m_key)
+                    if m_val:
+                        converted[m_key] = m_val
             else:
                 converted["media_type"] = 1
             if node.get("display_url"):
@@ -1285,47 +1313,27 @@ class InstagramClient(BasePlatformClient):
                 break
             cursor = end_cursor
 
-    def fetch_user_raw_reels_paginated(
+    def _fetch_user_reels_mobile(
         self,
         user_id: str,
         max_pages: Optional[int] = None,
         username: Optional[str] = None,
     ) -> Generator[dict, None, None]:
-        """Yields the Reels tab in strict newest-to-oldest order.
+        """Fetches reels from the mobile clips endpoint (api/v1/clips/user/).
 
-        Instagram pins reels at the top of the tab and returns pages in
-        chronological order (newest to oldest). Each page's items are deduplicated
-        and sorted so that pinned reels are yielded first, followed by reels in
-        descending chronological order.
-
-        Yielding items page-by-page allows consumers to stream downloads
-        immediately without buffering the account's entire history.
-
-        If a page fails after retries, the items fetched so far are still
-        yielded and a truncation error is raised afterwards, so the caller can
-        report that older reels were not reached instead of looking complete.
+        This endpoint returns clips associated with the user, including reels
+        hidden from the profile grid or web reels tab.
         """
         seen = set()
         max_id = None
         pages_fetched = 0
-        yielded_any = False
-        api_error_title = ""
-        api_logout_reason = None
-        api_require_login = False
-        api_status_code = 200
         consecutive_empty_pages = 0
         truncation: Optional[str] = None
 
-        # Route 1: When browser session cookies are available, use the official Web GraphQL Reels tab query
-        if self.cookies_file:
-            try:
-                for entry in self._fetch_user_reels_graphql(user_id, max_pages=max_pages, username=username):
-                    yielded_any = True
-                    yield entry
-                if yielded_any:
-                    return
-            except Exception:
-                pass
+        self._last_reels_api_status = 200
+        self._last_reels_error_title = ""
+        self._last_reels_logout_reason = None
+        self._last_reels_require_login = False
 
         while max_pages is None or pages_fetched < max_pages:
             data = {"target_user_id": user_id, "page_size": 12}
@@ -1342,7 +1350,7 @@ class InstagramClient(BasePlatformClient):
             )
             pages_fetched += 1
             if response is None:
-                api_status_code = 0
+                self._last_reels_api_status = 0
                 if pages_fetched > 1:
                     truncation = (
                         f"Reels feed for @{username or user_id} stopped at page "
@@ -1350,14 +1358,14 @@ class InstagramClient(BasePlatformClient):
                     )
                 break
 
-            api_status_code = response.status_code
-            api_require_login = False
+            self._last_reels_api_status = response.status_code
+            self._last_reels_require_login = False
             if response.status_code != 200:
                 try:
                     err_json = response.json()
-                    api_error_title = err_json.get("error_title", "")
-                    api_logout_reason = err_json.get("logout_reason")
-                    api_require_login = bool(err_json.get("require_login"))
+                    self._last_reels_error_title = err_json.get("error_title", "")
+                    self._last_reels_logout_reason = err_json.get("logout_reason")
+                    self._last_reels_require_login = bool(err_json.get("require_login"))
                 except Exception:
                     pass
 
@@ -1375,7 +1383,7 @@ class InstagramClient(BasePlatformClient):
                     )
                     if retry_resp is not None and retry_resp.status_code == 200:
                         response = retry_resp
-                        api_status_code = 200
+                        self._last_reels_api_status = 200
                     else:
                         # Last resort: anonymous retry for public profiles.
                         clean_headers = {
@@ -1395,7 +1403,7 @@ class InstagramClient(BasePlatformClient):
                             )
                             if clean_resp.status_code == 200:
                                 response = clean_resp
-                                api_status_code = 200
+                                self._last_reels_api_status = 200
                         except Exception:
                             pass
 
@@ -1433,10 +1441,8 @@ class InstagramClient(BasePlatformClient):
                     seen.add(identity)
                 page_entries.append(entry)
 
-            # Sort page entries so pinned reels are first, followed by newest to oldest
             page_entries.sort(key=self._reels_sort_key)
             for entry in page_entries:
-                yielded_any = True
                 yield entry
 
             paging_info = result.get("paging_info") or {}
@@ -1465,6 +1471,188 @@ class InstagramClient(BasePlatformClient):
                 )
                 break
             max_id = next_max_id
+
+        if truncation:
+            raise RuntimeError(truncation)
+
+    def _merge_reels_streams(
+        self,
+        graphql_iter: Generator[dict, None, None],
+        mobile_iter: Generator[dict, None, None],
+    ) -> Generator[dict, None, None]:
+        """Merges Web GraphQL reels and mobile clips in strict chronological order.
+
+        Deduplicates items between the two feeds, enriches entries with
+        video_versions when available, puts pinned reels first, and maintains a
+        buffer to ensure all reels (both publicly visible and hidden from profile)
+        are yielded in descending chronological sequence.
+        """
+        seen_map = {}
+        buffer = []
+        graphql_active = True
+        mobile_active = True
+        truncation_error = None
+
+        def pull_batch(iterator, n=24):
+            nonlocal truncation_error
+            items = []
+            for _ in range(n):
+                try:
+                    item = next(iterator)
+                    items.append(item)
+                except StopIteration:
+                    return items, False
+                except RuntimeError as exc:
+                    if "stopped at page" in str(exc):
+                        truncation_error = exc
+                    return items, False
+                except Exception:
+                    return items, False
+            return items, True
+
+        def add_items(items):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                ident = str(it.get("code") or it.get("pk") or "")
+                if ident and ident in seen_map:
+                    existing = seen_map[ident]
+                    for k, v in it.items():
+                        if existing.get(k) in (None, "") and v not in (None, ""):
+                            existing[k] = v
+                    if "video_versions" in it and "video_versions" not in existing:
+                        existing["video_versions"] = it["video_versions"]
+                        existing.pop("_needs_full_fetch", None)
+                    continue
+                if ident:
+                    seen_map[ident] = it
+                buffer.append(it)
+
+        # Initial batch pull from both streams
+        if graphql_active:
+            items_g, graphql_active = pull_batch(graphql_iter, 24)
+            add_items(items_g)
+
+        if mobile_active:
+            items_m, mobile_active = pull_batch(mobile_iter, 24)
+            add_items(items_m)
+
+        # Yield pinned reels first
+        pinned_reels = []
+        unpinned_reels = []
+        for it in buffer:
+            if self._is_pinned(it):
+                pinned_reels.append(it)
+            else:
+                unpinned_reels.append(it)
+
+        for it in pinned_reels:
+            yield it
+
+        buffer = unpinned_reels
+        buffer.sort(key=self._reels_sort_key)
+
+        while buffer:
+            # Maintain a lookahead buffer window while streams are active
+            if len(buffer) < 12 and (graphql_active or mobile_active):
+                if graphql_active:
+                    batch_g, graphql_active = pull_batch(graphql_iter, 24)
+                    add_items(batch_g)
+                if mobile_active:
+                    batch_m, mobile_active = pull_batch(mobile_iter, 24)
+                    add_items(batch_m)
+
+                new_pinned = [it for it in buffer if self._is_pinned(it)]
+                buffer = [it for it in buffer if not self._is_pinned(it)]
+                for p in new_pinned:
+                    yield p
+
+                buffer.sort(key=self._reels_sort_key)
+
+            if not buffer:
+                break
+
+            yield buffer.pop(0)
+
+            if not buffer and (graphql_active or mobile_active):
+                if graphql_active:
+                    batch_g, graphql_active = pull_batch(graphql_iter, 24)
+                    add_items(batch_g)
+                if mobile_active:
+                    batch_m, mobile_active = pull_batch(mobile_iter, 24)
+                    add_items(batch_m)
+                buffer = [it for it in buffer if not self._is_pinned(it)]
+                buffer.sort(key=self._reels_sort_key)
+
+        if truncation_error is not None:
+            raise truncation_error
+
+    def fetch_user_raw_reels_paginated(
+        self,
+        user_id: str,
+        max_pages: Optional[int] = None,
+        username: Optional[str] = None,
+    ) -> Generator[dict, None, None]:
+        """Yields the Reels tab in strict newest-to-oldest order.
+
+        Detects and downloads both visible and hidden reels:
+        1. When browser cookies are provided, merges Web GraphQL (PolarisProfileReelsTabContentQuery)
+           and Mobile Clips (api/v1/clips/user/) in a unified stream.
+        2. Deduplicates items and sorts them so pinned reels are yielded first,
+           followed by remaining reels in strict descending chronological order.
+        3. If neither primary endpoint yields content, falls back to the posts feed
+           and embedded profile timeline.
+
+        Yielding items page-by-page allows consumers to stream downloads
+        immediately without buffering the account's entire history.
+        """
+        seen = set()
+        yielded_any = False
+
+        self._last_reels_api_status = 200
+        self._last_reels_error_title = ""
+        self._last_reels_logout_reason = None
+        self._last_reels_require_login = False
+
+        if self.cookies_file:
+            try:
+                graphql_iter = self._fetch_user_reels_graphql(user_id, max_pages=max_pages, username=username)
+                mobile_iter = self._fetch_user_reels_mobile(user_id, max_pages=max_pages, username=username)
+                for entry in self._merge_reels_streams(graphql_iter, mobile_iter):
+                    identity = str(entry.get("code") or entry.get("pk") or "")
+                    if identity:
+                        seen.add(identity)
+                    yielded_any = True
+                    yield entry
+                if yielded_any:
+                    return
+            except RuntimeError as exc:
+                if "stopped at page" in str(exc):
+                    raise
+                if yielded_any:
+                    return
+            except Exception:
+                if yielded_any:
+                    return
+
+        if not yielded_any:
+            try:
+                for entry in self._fetch_user_reels_mobile(user_id, max_pages=max_pages, username=username):
+                    identity = str(entry.get("code") or entry.get("pk") or "")
+                    if identity:
+                        seen.add(identity)
+                    yielded_any = True
+                    yield entry
+                if yielded_any:
+                    return
+            except RuntimeError as exc:
+                if "stopped at page" in str(exc):
+                    raise
+                if yielded_any:
+                    return
+            except Exception:
+                if yielded_any:
+                    return
 
         if not yielded_any:
             fallback_entries = []
@@ -1506,6 +1694,11 @@ class InstagramClient(BasePlatformClient):
                 for entry in fallback_entries:
                     yield entry
                 return
+
+            api_status_code = getattr(self, "_last_reels_api_status", 200)
+            api_error_title = getattr(self, "_last_reels_error_title", "")
+            api_logout_reason = getattr(self, "_last_reels_logout_reason", None)
+            api_require_login = getattr(self, "_last_reels_require_login", False)
 
             # Check whether the profile is age-restricted before giving up.
             restriction = None
@@ -1559,9 +1752,6 @@ class InstagramClient(BasePlatformClient):
                     f"Instagram returned HTTP {api_status_code}."
                 )
             return
-
-        if truncation:
-            raise RuntimeError(truncation)
 
     @staticmethod
     def _parse_dash_manifest_to_root(manifest_input: Any) -> Optional[ET.Element]:
@@ -1712,7 +1902,12 @@ class InstagramClient(BasePlatformClient):
                             "is_xheaac": is_xheaac,
                         })
                     elif is_video:
-                        is_1080 = ("1080" in quality_label) or min(w, h) >= 1080
+                        is_1080 = (
+                            ("1080" in str(quality_label))
+                            or min(w, h) >= 1080
+                            or max(w, h) >= 1920
+                            or (w * h) >= 1166400
+                        )
                         video_reps.append({
                             "url": url,
                             "width": w,
@@ -1892,7 +2087,9 @@ class InstagramClient(BasePlatformClient):
             if m_val:
                 v_cand, a_cand = self._extract_dash_streams(m_val)
                 if v_cand:
-                    if not dash_v or v_cand.get("pixels", 0) > dash_v.get("pixels", 0):
+                    cand_score = (1 if v_cand.get("is_1080p") else 0, v_cand.get("pixels", 0), v_cand.get("bandwidth", 0))
+                    dash_score = (1 if dash_v.get("is_1080p") else 0, dash_v.get("pixels", 0), dash_v.get("bandwidth", 0)) if dash_v else (-1, -1, -1)
+                    if cand_score > dash_score:
                         dash_v = v_cand
                 if a_cand:
                     if not dash_a or a_cand.get("bandwidth", 0) > dash_a.get("bandwidth", 0):
@@ -1926,6 +2123,7 @@ class InstagramClient(BasePlatformClient):
                 dash_v.get("is_1080p")
                 or "1080" in str(dash_v.get("quality_label", ""))
                 or min(dash_v.get("width", 0), dash_v.get("height", 0)) >= 1080
+                or max(dash_v.get("width", 0), dash_v.get("height", 0)) >= 1920
                 or dash_pixels >= 1166400
             )
         )
@@ -1933,6 +2131,7 @@ class InstagramClient(BasePlatformClient):
             best_prog and (
                 "1080" in str(best_prog.get("quality_label", ""))
                 or min(best_prog.get("width", 0), best_prog.get("height", 0)) >= 1080
+                or max(best_prog.get("width", 0), best_prog.get("height", 0)) >= 1920
                 or prog_pixels >= 1166400
             )
         )

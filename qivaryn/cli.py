@@ -225,7 +225,11 @@ def single(url_or_id, platform, cookies_file, sessionid, output, db, force, qual
         quality=quality,
         quality_provided=_quality_was_provided(),
     )
-    engine.download_single(url_or_id, force=force)
+    try:
+        engine.download_single(url_or_id, force=force)
+    except KeyboardInterrupt:
+        engine.stop()
+        click.echo("\n[-] Download cancelled by user (Ctrl+C). Incomplete files removed.")
 
 
 @cli.command()
@@ -262,13 +266,17 @@ def download(account, platform, cookies_file, sessionid, media_type, count, limi
         quality=quality,
         quality_provided=_quality_was_provided(),
     )
-    engine.download_account(
-        account,
-        media_type_filter=media_type or "all",
-        max_pages=max_pages,
-        force=force,
-        count=target_count,
-    )
+    try:
+        engine.download_account(
+            account,
+            media_type_filter=media_type or "all",
+            max_pages=max_pages,
+            force=force,
+            count=target_count,
+        )
+    except KeyboardInterrupt:
+        engine.stop()
+        click.echo("\n[-] Bulk download stopped by user (Ctrl+C). Incomplete files removed.")
 
 
 @cli.command("url", hidden=True)
@@ -305,13 +313,17 @@ def download_url(url, media_type, cookies_file, sessionid, count, limit, output,
         quality=quality,
         quality_provided=_quality_was_provided(),
     )
-    engine.download_url(
-        url,
-        max_pages=max_pages,
-        force=force,
-        count=target_count,
-        media_type=media_type,
-    )
+    try:
+        engine.download_url(
+            url,
+            max_pages=max_pages,
+            force=force,
+            count=target_count,
+            media_type=media_type,
+        )
+    except KeyboardInterrupt:
+        engine.stop()
+        click.echo("\n[-] Bulk download stopped by user (Ctrl+C). Incomplete files removed.")
 
 
 @cli.command()

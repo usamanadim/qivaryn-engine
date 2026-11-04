@@ -98,6 +98,41 @@ class DashManifestAndResolutionTests(unittest.TestCase):
         self.assertEqual(v_url, "https://cdn.example/1080.mp4")
         self.assertEqual(a_url, "https://cdn.example/clean-standard-aac.mp4")
 
+    def test_extract_dash_recognizes_horizontal_1080p(self):
+        client = InstagramClient()
+        xml = """<MPD><Period><AdaptationSet contentType="video"><Representation width="1920" height="1080" bandwidth="2000000"><BaseURL>https://cdn.example/1080h.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>"""
+        v, _ = client._extract_dash_streams(xml)
+        self.assertIsNotNone(v)
+        self.assertTrue(v["is_1080p"])
+        self.assertEqual(v["url"], "https://cdn.example/1080h.mp4")
+
+    def test_select_best_video_prefers_higher_bandwidth_1080p_manifest(self):
+        client = InstagramClient()
+        item = {
+            "code": "TEST_BW_1080P",
+            "media_type": 2,
+            "video_dash_manifest": """<MPD><Period><AdaptationSet contentType="video"><Representation width="1080" height="1920" bandwidth="1000000"><BaseURL>https://cdn.example/low_bw_1080.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>""",
+            "dash_manifest": """<MPD><Period><AdaptationSet contentType="video"><Representation width="1080" height="1920" bandwidth="3000000"><BaseURL>https://cdn.example/high_bw_1080.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>""",
+        }
+        v_url, _, qual = client._select_best_video(item)
+        self.assertEqual(v_url, "https://cdn.example/high_bw_1080.mp4")
+        self.assertIn("1080", qual)
+
+    def test_normalize_web_media_preserves_dash_manifest(self):
+        media = {
+            "shortcode": "TEST_GRAPHQL_DASH",
+            "video_url": "https://cdn.example/prog_720.mp4",
+            "dimensions": {"width": 720, "height": 1280},
+            "video_dash_manifest": """<MPD><Period><AdaptationSet contentType="video"><Representation width="1080" height="1920"><BaseURL>https://cdn.example/dash_1080.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>""",
+        }
+        normalized = InstagramClient._normalize_web_media(media, "TEST_GRAPHQL_DASH")
+        self.assertIsNotNone(normalized)
+        self.assertIn("video_dash_manifest", normalized)
+        client = InstagramClient()
+        v_url, _, qual = client._select_best_video(normalized)
+        self.assertEqual(v_url, "https://cdn.example/dash_1080.mp4")
+        self.assertIn("1080", qual)
+
 
 
 class StreamMergeUnitTests(unittest.TestCase):

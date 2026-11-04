@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from typing import Callable, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -20,6 +21,7 @@ import requests
 from tqdm import tqdm
 
 from .client import InstagramClient
+from .controller import DownloadController, KeyboardListener
 from .database import StateDatabase
 from .files import (
     MEDIA_TYPE_BY_KIND,
@@ -58,11 +60,13 @@ class QivarynEngine:
         allow_network_fallbacks: bool = True,
         quality: str = "best",
         quality_confirmer: Optional[Callable[[dict], bool]] = None,
+        controller: Optional[DownloadController] = None,
     ):
         self.platform = (platform or "instagram").lower()
         self.quality = quality or "best"
         self.quality_confirmer = quality_confirmer
         self.output_dir = output_dir
+        self.controller = controller or DownloadController()
         self.client = self._build_client(
             sessionid=sessionid,
             cookies_file=cookies_file,
@@ -99,6 +103,26 @@ class QivarynEngine:
             self._default_last_http_status = val
         else:
             tls.last_http_status = val
+
+    def pause(self) -> None:
+        """Temporarily pauses the active bulk download."""
+        self.controller.pause()
+
+    def resume(self) -> None:
+        """Resumes the bulk download from where it was paused."""
+        self.controller.resume()
+
+    def stop(self) -> None:
+        """Immediately stops the bulk download and cancels any active reel."""
+        self.controller.stop()
+
+    @property
+    def is_paused(self) -> bool:
+        return self.controller.is_paused
+
+    @property
+    def is_stopped(self) -> bool:
+        return self.controller.is_stopped
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -510,8 +534,22 @@ class QivarynEngine:
         previous_account = self._current_account
         self._current_account = account
 
+        listener = None
+        if getattr(self, "controller", None):
+            self.controller.reset()
+            lbl = "Reels" if filter_mode == "reels" else ("Posts" if filter_mode == "posts" else "Items")
+            self.controller.stats.set_target(count, item_label=lbl)
+            if sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
+                try:
+                    listener = KeyboardListener(self.controller)
+                    listener.start()
+                except Exception:
+                    listener = None
+
         try:
             for feed in feeds:
+                if getattr(self, "controller", None) and self.controller.is_stopped:
+                    break
                 remaining = None if count is None else count - total_downloaded
                 if remaining is not None and remaining <= 0:
                     break
@@ -527,7 +565,16 @@ class QivarynEngine:
                 total_downloaded += downloaded
                 total_skipped += skipped
         finally:
+            if listener:
+                listener.stop()
             self._current_account = previous_account
+
+        if getattr(self, "controller", None) and self.controller.is_stopped:
+            print(f"\n[!] Bulk download was stopped by user.")
+            print(f"[+] Successfully completed {total_downloaded} items before stopping.\n")
+            if total_downloaded > 0:
+                print(self.controller.stats.format_overview("Final Download Statistics"))
+            return total_downloaded
 
         if self.failed_items:
             print(
@@ -549,6 +596,8 @@ class QivarynEngine:
                 f"\n[+] Download session complete! Downloaded {total_downloaded} new "
                 f"items{skip_str} for {label}."
             )
+            if getattr(self, "controller", None):
+                print("\n" + self.controller.stats.format_overview("Final Download Statistics"))
         else:
             explanation = self.client.explain_empty_result(account)
             if explanation:
@@ -615,10 +664,15 @@ class QivarynEngine:
         downloaded = 0
         skipped = 0
         seen = set()
+        detected_count = 0
         iterator = iter(items)
 
         while True:
             if count is not None and downloaded >= count:
+                break
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                break
+            if getattr(self, "controller", None) and not self.controller.wait_if_paused():
                 break
 
             try:
@@ -648,8 +702,16 @@ class QivarynEngine:
             if not self.client.prefilter(raw, filter_mode):
                 continue
 
+            detected_count += 1
+            if getattr(self, "controller", None):
+                self.controller.stats.update(
+                    total_detected=max(detected_count, count if count is not None else detected_count)
+                )
+
             if not force and (item_id in known or self._is_item_already_saved(item_id)):
                 skipped += 1
+                if getattr(self, "controller", None):
+                    self.controller.stats.update(already_downloaded=skipped)
                 if count is None and self.consecutive_threshold > 0:
                     consecutive_known += 1
                     if consecutive_known >= self.consecutive_threshold:
@@ -671,6 +733,12 @@ class QivarynEngine:
             if not self.client.matches_filter(item.get("media_type"), filter_mode):
                 continue
 
+            if getattr(self, "controller", None):
+                if self.controller.is_stopped:
+                    break
+                if not self.controller.wait_if_paused():
+                    break
+
             try:
                 result = self._download_media_item(item, force=force)
                 if result is False and self.platform == "instagram":
@@ -686,12 +754,18 @@ class QivarynEngine:
                 self._record_failure(item_id, str(exc))
                 continue
 
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                break
+
             if result is None:
                 continue
             if result:
                 downloaded += 1
                 known.add(item_id)
                 known.add(str(item.get("id") or item_id))
+                if getattr(self, "controller", None):
+                    self.controller.stats.update(downloaded=downloaded)
+                    print("    " + self.controller.stats.format_inline())
                 if count is not None:
                     print(f"    [Batch Progress] {downloaded}/{count} new items downloaded.")
                     if downloaded >= count:
@@ -752,6 +826,8 @@ class QivarynEngine:
         item_id = str(item.get("id") or item.get("shortcode") or "")
         if not item_id:
             return False
+        if getattr(self, "controller", None) and self.controller.is_stopped:
+            return False
 
         media_type = item.get("media_type") or "Post"
         timestamp = item.get("timestamp") or ""
@@ -762,7 +838,11 @@ class QivarynEngine:
 
         if media_type == "Carousel" and item.get("children"):
             success_all = True
+            downloaded_children = []
             for index, child in enumerate(item["children"], start=1):
+                if getattr(self, "controller", None) and self.controller.is_stopped:
+                    success_all = False
+                    break
                 is_video = bool(child.get("is_video"))
                 ext = child.get("ext") or ("mp4" if is_video else "jpg")
                 file_path = os.path.join(directory, f"{stem}_{index}.{ext}")
@@ -787,10 +867,18 @@ class QivarynEngine:
                                              description, headers=child_headers)
                 if not ok:
                     success_all = False
+                    break
                 elif file_is_present(file_path):
-                    self._remember_downloaded_file(file_path)
+                    downloaded_children.append(file_path)
+
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                for child_path in downloaded_children:
+                    self._remove_partial_file(child_path)
+                return False
 
             if success_all:
+                for child_path in downloaded_children:
+                    self._remember_downloaded_file(child_path)
                 self.db.mark_downloaded(
                     item_id, media_type, timestamp, "carousel_bundle", platform=self.platform
                 )
@@ -820,6 +908,9 @@ class QivarynEngine:
                 headers=headers,
                 ext=ext,
             )
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                self._remove_partial_file(file_path)
+                return False
             if ok:
                 self.db.mark_downloaded(item_id, media_type, timestamp, file_path,
                                         platform=self.platform)
@@ -830,8 +921,14 @@ class QivarynEngine:
         if not display_url:
             print(f"[-] No downloadable URL was found for {item_id}.")
             return False
+        if getattr(self, "controller", None) and self.controller.is_stopped:
+            self._remove_partial_file(file_path)
+            return False
         if self._download_file(display_url, file_path, f"[{media_type}] {item_id}",
                                headers=headers):
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                self._remove_partial_file(file_path)
+                return False
             self.db.mark_downloaded(item_id, media_type, timestamp, file_path,
                                     platform=self.platform)
             self._remember_downloaded_file(file_path)
@@ -886,6 +983,13 @@ class QivarynEngine:
             temp_output = f"{file_path}.temp_mux.{ext}"
             container_args = ["-movflags", "+faststart"] if ext == "mp4" else []
             progress_lock = threading.Lock()
+            if getattr(self, "controller", None):
+                if self.controller.is_stopped:
+                    return False
+                self.controller.register_active_file(temp_v)
+                self.controller.register_active_file(temp_a)
+                self.controller.register_active_file(temp_output)
+                self.controller.register_active_file(file_path)
             try:
                 with tqdm(
                     desc=desc,
@@ -985,10 +1089,21 @@ class QivarynEngine:
                         print(f"[-] FFmpeg could not merge {desc} (exit code {result.returncode}).")
                 return False
             finally:
+                if getattr(self, "controller", None):
+                    self.controller.unregister_active_file(temp_v)
+                    self.controller.unregister_active_file(temp_a)
+                    self.controller.unregister_active_file(temp_output)
+                    self.controller.unregister_active_file(file_path)
                 for tmp in (temp_v, temp_a, temp_output):
                     if os.path.exists(tmp):
                         try:
                             os.remove(tmp)
+                        except OSError:
+                            pass
+                if getattr(self, "controller", None) and self.controller.is_stopped:
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
                         except OSError:
                             pass
 
@@ -1105,6 +1220,9 @@ class QivarynEngine:
         if not url:
             print(f"[-] No download URL available for {desc}.")
             return False
+        if getattr(self, "controller", None) and self.controller.is_stopped:
+            self._remove_partial_file(file_path)
+            return False
 
         self._last_http_status = None
         if self._download_file_stream(
@@ -1198,6 +1316,11 @@ class QivarynEngine:
                 )
                 with open(file_path, "wb") as file, bar_context as local_bar:
                     for chunk in response.iter_content(chunk_size=65536):
+                        if getattr(self, "controller", None):
+                            if self.controller.is_stopped:
+                                break
+                            if not self.controller.wait_if_paused():
+                                break
                         if chunk:
                             file.write(chunk)
                             chunk_len = len(chunk)
@@ -1210,6 +1333,14 @@ class QivarynEngine:
                                     progress_bar.update(chunk_len)
                             else:
                                 local_bar.update(chunk_len)
+            if getattr(self, "controller", None) and self.controller.is_stopped:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
+                return False
+
             if bytes_written == 0:
                 print(f"[-] Download returned an empty file for {desc}.")
                 if progress_bar is not None and stream_total > 0:
@@ -1331,9 +1462,16 @@ class QivarynEngine:
                 position=position,
             )
         )
+        if getattr(self, "controller", None):
+            self.controller.register_active_file(file_path)
         try:
             with open(file_path, "wb") as file, bar_context as local_bar:
                 while total_size == 0 or bytes_written < total_size:
+                    if getattr(self, "controller", None):
+                        if self.controller.is_stopped:
+                            break
+                        if not self.controller.wait_if_paused():
+                            break
                     start = bytes_written
                     end = start + chunk_size - 1
                     if total_size:
@@ -1463,7 +1601,18 @@ class QivarynEngine:
                         progress_bar.total = max(0, progress_bar.total - total_size)
                     progress_bar.refresh()
             self._remove_partial_file(file_path)
+            if getattr(self, "controller", None):
+                self.controller.unregister_active_file(file_path)
             return False
+
+        if getattr(self, "controller", None) and self.controller.is_stopped:
+            self._remove_partial_file(file_path)
+            if getattr(self, "controller", None):
+                self.controller.unregister_active_file(file_path)
+            return False
+
+        if getattr(self, "controller", None):
+            self.controller.unregister_active_file(file_path)
         return True
 
     # ------------------------------------------------------------------
